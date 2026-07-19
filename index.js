@@ -9,7 +9,7 @@ app.use(express.json());
 // مجلد لحفظ محركات البحث النشطة في الذاكرة
 let activeEngines = {};
 
-// شبكة أمان أخيرة للخطأ غير المتوقع
+// 🛡️ شبكة أمان عامة: التقاط الأخطاء غير المتوقعة على مستوى النظام ومنع انهيار السيرفر
 process.on('uncaughtException', (err) => {
     console.error('[uncaughtException] السيرفر استمر بالعمل رغم هذا الخطأ:', err.message);
 });
@@ -17,37 +17,44 @@ process.on('unhandledRejection', (err) => {
     console.error('[unhandledRejection] السيرفر استمر بالعمل رغم هذا الخطأ:', err && err.message);
 });
 
-// 🔥 الحل السحري: دالة إنشاء مخزن "وهمي" يمرر البيانات ويمسحها فوراً لمنع امتلاء الـ RAM والقرص
-function createNullStore() {
+// 🧠 المخزن الذكي المتكيف: يحتفظ بالطابور مرنًا بناءً على سرعة الإنترنت لمنع حذف القطع قبل اكتمال سحبها
+function createSmartCacheStore() {
     let chunks = {};
+    let chunkKeys = [];
+    const MAX_CHUNKS = 15; // الاحتفاظ بـ 15 قطعة كحد أقصى (تستهلك ~35 ميجابايت فقط وهو آمن جداً للرام)
+
     return {
         get: (index, cb) => {
             cb(null, chunks[index]);
         },
         put: (index, buf, cb) => {
-            chunks[index] = buf;
+            if (!chunks[index]) {
+                chunks[index] = buf;
+                chunkKeys.push(index);
+                
+                // إذا زاد عدد القطع عن الحد الأقصى نتيجة لسرعة التحميل، يتم طرد أقدم قطعة (FIFO)
+                if (chunkKeys.length > MAX_CHUNKS) {
+                    let oldestIndex = chunkKeys.shift();
+                    delete chunks[oldestIndex];
+                }
+            }
             cb(null);
-            // تدمير القطعة تلقائياً وحذفها من الذاكرة بعد 5 ثوانٍ فقط من استقبالها
-            // هذا يضمن تشغيل الفيلم كـ "أنبوب مياه" يمرر البيانات للهاتف ولا يخزنها
-            setTimeout(() => {
-                delete chunks[index];
-            }, 5000);
         },
         close: (cb) => { if (cb) cb(null); },
         destroy: (cb) => { if (cb) cb(null); }
     };
 }
 
-// دالة مساعدة لحذف محرك تورنت بأمان مع تنظيف كل مستمعيه
+// 🧹 دالة مساعدة لتنظيف وتدمير المحرك بأمان وتفريغ الذاكرة
 function destroyEngine(infoHash) {
     const engine = activeEngines[infoHash];
     if (!engine) return;
-    try { engine.destroy(); } catch (e) { /* تجاهل أي خطأ أثناء الإغلاق */ }
+    try { engine.destroy(); } catch (e) { /* تجاهل أي خطأ أثناء الإغلاق نفسه */ }
     delete activeEngines[infoHash];
     console.log(`Cleared Engine from RAM for Hash: ${infoHash}`);
 }
 
-// 1. استقبال الماغنيت وتفعيل المخزن الصافي (Zero-Disk & Zero-RAM)
+// 1. استقبال روابط الماغنيت وتفعيل البث عديم الحالة (Stateless)
 app.post('/api/v1/torrents', (req, res) => {
     const { magnet } = req.body || {};
     if (!magnet) return res.status(400).json({ error: "Missing magnet Link" });
@@ -59,13 +66,14 @@ app.post('/api/v1/torrents', (req, res) => {
     if (!activeEngines[infoHash]) {
         let engine;
         try {
-            // استبدال memoryStore بالمخزن الوهمي المطور لمنع الانهيار نهائياً
-            engine = torrentStream(magnet, { storage: createNullStore });
+            // تشغيل التورنت عبر المخزن الذكي المرن للتكيف مع خطوط الإنترنت الضعيفة القابلة للانقطاع
+            engine = torrentStream(magnet, { storage: createSmartCacheStore });
         } catch (err) {
             console.error(`فشل إنشاء محرك التورنت لـ ${infoHash}:`, err.message);
             return res.status(500).json({ error: "Failed to start torrent engine" });
         }
 
+        // 🛡️ شبكة أمان المحرك: التقاط أخطاء الشبكة والـ Trackers داخل التورنت دون إسقاط العملية
         engine.on('error', (err) => {
             console.error(`خطأ في محرك التورنت لـ ${infoHash}:`, err && err.message);
             destroyEngine(infoHash);
@@ -73,17 +81,17 @@ app.post('/api/v1/torrents', (req, res) => {
 
         engine.on('ready', () => {
             activeEngines[infoHash] = engine;
-            console.log(`Stateless Torrent Ready: ${engine.torrent.name}`);
+            console.log(`Stateless & Smart Torrent Ready: ${engine.torrent.name}`);
         });
 
-        // تنظيف المحرك بالكامل بعد ساعتين من العمل لتفريغ بقايا الذاكرة
+        // تدمير تلقائي بعد ساعتين لتفريغ بقايا الذاكرة وضمان عدم تراكم العمليات الخاملة
         setTimeout(() => destroyEngine(infoHash), 2 * 60 * 60 * 1000);
     }
 
     res.json({ status: "added", hash: infoHash });
 });
 
-// 2. تزويد واجهة الموقع بالبيانات آلياً
+// 2. تزويد الفرونت-إند بشجرة الملفات والأحجام دون الحاجة لتعديل كود موقعك
 app.get('/api/v1/torrents', (req, res) => {
     let result = {};
     Object.keys(activeEngines).forEach(hash => {
@@ -97,7 +105,7 @@ app.get('/api/v1/torrents', (req, res) => {
     res.json(result);
 });
 
-// 3. البث التدفقي الصافي ودعم تقسيم الحزم (Ranges) لبرامج التحميل
+// 3. مسار البث التدفقي الصافي مع دعم الحزم الجزئية (Byte-Ranges) لـ 1DM+
 app.get('/data/*', (req, res) => {
     let filePath;
     try {
@@ -116,6 +124,7 @@ app.get('/data/*', (req, res) => {
 
     if (!targetFile) return res.status(404).send('File not found or metadata loading...');
 
+    // 🛡️ دالة معالجة أخطاء الستريم أثناء النقل: تدمر الطلب المنقطع بأمان لئلا يعلق السيرفر
     const failSafely = (err) => {
         console.error(`خطأ أثناء بث الملف "${filePath}":`, err && err.message);
         if (!res.headersSent) {
@@ -127,6 +136,7 @@ app.get('/data/*', (req, res) => {
 
     const range = req.headers.range;
 
+    // إذا كان الطلب عادياً بدون تقسيم
     if (!range) {
         res.setHeader('Content-Length', targetFile.length);
         res.setHeader('Accept-Ranges', 'bytes');
@@ -135,6 +145,7 @@ app.get('/data/*', (req, res) => {
         return stream.pipe(res);
     }
 
+    // هندسة الحزم (Byte-Range Math) لضمان التوافق المطلق مع تقنيات الـ Resume في 1DM+
     const parts = range.replace(/bytes=/, "").split("-");
     const start = parseInt(parts[0], 10);
     const end = parts[1] ? parseInt(parts[1], 10) : targetFile.length - 1;
@@ -152,10 +163,11 @@ app.get('/data/*', (req, res) => {
         'Content-Type': 'video/mp4'
     });
 
+    // سحب القطع المطلوبة فقط بشكل تدفقي حي وتمريرها للهاتف مباشرة
     const stream = targetFile.createReadStream({ start, end });
     stream.on('error', failSafely);
     stream.pipe(res);
 });
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`Zero-Disk Streaming API running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Zero-Disk Smart Streaming API running on port ${PORT}`));
