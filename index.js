@@ -17,11 +17,11 @@ process.on('unhandledRejection', (err) => {
     console.error('[unhandledRejection] السيرفر استمر بالعمل رغم هذا الخطأ:', err && err.message);
 });
 
-// 🧠 المخزن الذكي المتكيف: يحتفظ بالطابور مرنًا بناءً على سرعة الإنترنت لمنع حذف القطع قبل اكتمال سحبها
+// 🧠 المخزن الذكي المتكيف العريض: تم رفع السعة لاستيعاب المسارات المتعددة لبرامج التحميل
 function createSmartCacheStore() {
     let chunks = {};
     let chunkKeys = [];
-    const MAX_CHUNKS = 15; // الاحتفاظ بـ 15 قطعة كحد أقصى (تستهلك ~35 ميجابايت فقط وهو آمن جداً للرام)
+    const MAX_CHUNKS = 80; // 🚀 تم الرفع من 15 إلى 80 قطعة لتوسيع مساحة المناورة لخيوط التحميل
 
     return {
         get: (index, cb) => {
@@ -32,7 +32,7 @@ function createSmartCacheStore() {
                 chunks[index] = buf;
                 chunkKeys.push(index);
                 
-                // إذا زاد عدد القطع عن الحد الأقصى نتيجة لسرعة التحميل، يتم طرد أقدم قطعة (FIFO)
+                // طرد أقدم قطعة (FIFO) عند امتلاء الطابور المرن
                 if (chunkKeys.length > MAX_CHUNKS) {
                     let oldestIndex = chunkKeys.shift();
                     delete chunks[oldestIndex];
@@ -66,22 +66,21 @@ app.post('/api/v1/torrents', (req, res) => {
     if (!activeEngines[infoHash]) {
         let engine;
         try {
-            // تشغيل التورنت عبر المخزن الذكي المرن للتكيف مع خطوط الإنترنت الضعيفة القابلة للانقطاع
+            // تشغيل التورنت عبر المخزن الذكي العريض
             engine = torrentStream(magnet, { storage: createSmartCacheStore });
         } catch (err) {
             console.error(`فشل إنشاء محرك التورنت لـ ${infoHash}:`, err.message);
             return res.status(500).json({ error: "Failed to start torrent engine" });
         }
 
-        // 🛡️ شبكة أمان المحرك: التقاط أخطاء الشبكة والـ Trackers داخل التورنت دون إسقاط العملية
+        // 🛡️ ترويض معالج الأخطاء: تسجيل تحذير فقط دون تدمير الجلسة فجأة أثناء التحميل
         engine.on('error', (err) => {
-            console.error(`خطأ في محرك التورنت لـ ${infoHash}:`, err && err.message);
-            destroyEngine(infoHash);
+            console.error(`[Warning] خطأ قراءة مؤقت في محرك التورنت لـ ${infoHash}:`, err && err.message);
         });
 
         engine.on('ready', () => {
             activeEngines[infoHash] = engine;
-            console.log(`Stateless & Smart Torrent Ready: ${engine.torrent.name}`);
+            console.log(`Stateless & High-Capacity Torrent Ready: ${engine.torrent.name}`);
         });
 
         // تدمير تلقائي بعد ساعتين لتفريغ بقايا الذاكرة وضمان عدم تراكم العمليات الخاملة
