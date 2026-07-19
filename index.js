@@ -69,6 +69,10 @@ function requireSecret(req, res, next) {
 }
 
 let activeEngines = {};
+// مرجع صريح لمخزن SlidingWindowStore الفعلي لكل تورنت - نلتقطه بأنفسنا عند إنشائه
+// (بدل تخمين اسم خاصية داخلية في torrent-stream مثل engine.store أو engine.storage،
+// وهو ما كان يفشل بصمت ويمنع أي عملية حذف من العمل إطلاقاً - انظر startEngine أدناه)
+let engineStores = {};
 let engineStatus = {}; // hash -> { state: 'loading'|'ready'|'failed', error?: string, lastAccess?: number }
 let pendingQueue = []; // [{ infoHash, magnet, queuedAt }] - طلبات تنتظر دورها لأن MAX_CONCURRENT_ENGINES ممتلئ
 let hardFlushCooldownUntil = 0; // بعد تنظيف طارئ، نمنع الطابور من إعادة الملء الفوري ليهدأ الاستخدام الفعلي للذاكرة (GC)
@@ -183,6 +187,7 @@ function destroyEngine(infoHash) {
     try { engine.destroy(); } catch (e) { }
     delete activeEngines[infoHash];
     delete engineStatus[infoHash];
+    delete engineStores[infoHash];
     console.log(`Cleared Engine from RAM for Hash: ${infoHash}`);
     processQueue(); // حرّرنا مكاناً - شغّل التالي في الطابور إن وُجد
 }
@@ -193,6 +198,7 @@ function failEngine(infoHash, reason) {
         try { engine.destroy(); } catch (e) { }
     }
     delete activeEngines[infoHash];
+    delete engineStores[infoHash];
     engineStatus[infoHash] = { state: 'failed', error: reason };
     console.error(`[FAILED] لم يتم العثور على بيانات/سيدرز لـ ${infoHash}: ${reason}`);
     processQueue(); // حرّرنا مكاناً هنا أيضاً
@@ -202,9 +208,16 @@ function failEngine(infoHash, reason) {
 function startEngine(infoHash, magnet) {
     let engine;
     try {
+        // نلفّ دالة المصنع لنلتقط مرجع المخزن الفعلي بأنفسنا وقت إنشائه - هذا أوثق من
+        // محاولة تخمين اسم الخاصية التي يضع بها torrent-stream المرجع داخل كائن engine لاحقاً
+        const capturingStorageFactory = (chunkLength, opts) => {
+            const storeInstance = slidingWindowStore(chunkLength, opts);
+            engineStores[infoHash] = storeInstance;
+            return storeInstance;
+        };
         // التخزين المخصص: نافذة متحركة من القطع حول موضع التشغيل الحالي بدل الاحتفاظ
         // بالملف كاملاً في الذاكرة (انظر sliding-window-store.js لتفاصيل الآلية)
-        engine = torrentStream(magnet, { storage: slidingWindowStore });
+        engine = torrentStream(magnet, { storage: capturingStorageFactory });
     } catch (err) {
         console.error(`فشل إنشاء محرك التورنت لـ ${infoHash}:`, err.message);
         engineStatus[infoHash] = { state: 'failed', error: err.message };
@@ -367,7 +380,15 @@ app.get('/data/*', (req, res) => {
 
     // مرجع التخزين المخصص (النافذة المتحركة) الخاص بهذا المحرك - نحدّث "رأس التشغيل" فيه
     // بناءً على البايتات المُرسَلة فعلياً للعميل، حتى تُحذف القطع الأقدم من الذاكرة تباعاً
-    const store = ownerEngine && (ownerEngine.store || ownerEngine.storage);
+    // مرجع التخزين المخصص (النافذة المتحركة) الخاص بهذا المحرك - يُلتقط صراحةً وقت الإنشاء
+    // في startEngine بدل تخمين خاصية داخلية في كائن engine (كانت هذه نقطة الفشل الفعلية:
+    // engine.store/engine.storage لم تكن الخاصية الصحيحة، فالحذف لم يعمل إطلاقاً من قبل)
+    const store = ownerHash && engineStores[ownerHash];
+    if (!store) {
+        // لا نوقف البث بسبب هذا - لكن نُسجّله بوضوح لأن غيابه يعني أن نافذة الذاكرة
+        // المتحركة لن تعمل لهذا الطلب (تماماً كما حدث سابقاً بصمت) - يجب ألا يظهر هذا أبداً
+        console.warn(`[SlidingWindowStore] تحذير: لم يُعثر على مخزن مرتبط بـ ${ownerHash} - لن يعمل حذف القطع القديمة لهذا التورنت`);
+    }
     // موضع هذا الملف داخل التورنت الكامل - القطع مرقّمة على مستوى التورنت وليس الملف
     const fileOffset = targetFile.offset || 0;
 
