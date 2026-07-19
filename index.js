@@ -3,31 +3,38 @@ const cors = require('cors');
 const torrentStream = require('torrent-stream');
 
 const app = express();
-app.use(cors());
+
+// 1. [تحسين مضاف]: قفل الحماية وتقييد الـ CORS على موقعك فقط لمنع الاستغلال الخارجي
+const ALLOWED_ORIGIN = "https://karimslimany.workers.dev"; // ضع دومين موقعك هنا بدقة
+
+app.use(cors({
+    origin: (origin, callback) => {
+        // السماح بالطلبات التي لا تحتوي على Origin (مثل تطبيقات الـ Android كـ 1DM+ أو أداة UptimeRobot)
+        if (!origin || origin === ALLOWED_ORIGIN) {
+            callback(null, true);
+        } else {
+            callback(new Error('Blocked by Security: Unauthorized Origin'));
+        }
+    }
+}));
 app.use(express.json());
 
-// مجلد لحفظ محركات البحث النشطة في الذاكرة
 let activeEngines = {};
 
-// 🛡️ شبكة أمان عامة للخطأ غير المتوقع
+// شبكة أمان عامة للخطأ غير المتوقع
 process.on('uncaughtException', (err) => {
-    console.error('[uncaughtException] السيرفر استمر بالعمل رغم هذا الخطأ:', err.message);
+    console.error('[uncaughtException] السيرفر مستمر بالعمل:', err.message);
 });
 process.on('unhandledRejection', (err) => {
-    console.error('[unhandledRejection] السيرفر استمر بالعمل رغم هذا الخطأ:', err && err.message);
+    console.error('[unhandledRejection] السيرفر مستمر بالعمل:', err && err.message);
 });
 
-// 🧠 كاش ميكروي يعتمد على "حجم البايتات" الفعلي بدل عدد ثابت من القطع.
-// السبب: حجم القطعة (piece length) يختلف من تورنت لآخر (قد يصل حتى 16 ميجابايت
-// بالملفات الضخمة)، فحد ثابت مثل "4 قطع" قد يعني أحياناً 4 ميجا فقط، وأحياناً
-// أخرى 64 ميجا — بينما هدفنا الحقيقي هو تحديد استهلاك الرام بالبايت مباشرة،
-// بغض النظر عن حجم القطعة، لضمان هامش أمان كافٍ يمنع حذف قطعة قبل قراءتها
-const MAX_CACHE_BYTES = 300 * 1024 * 1024; // ~300 ميجابايت (هامش آمن ضمن حد Render المجاني 512MB)
-
-function createMicroCacheStore() {
+// 🧠 [التعديل الجوهري]: كاش ذكي يعتمد على ميزانية البايتات الفعلية (~300MB) لتفادي التلف الصامت
+function createByteLimitStore() {
     let chunks = {};
     let chunkKeys = [];
-    let totalBytes = 0;
+    let currentCacheBytes = 0;
+    const MAX_CACHE_BYTES = 300 * 1024 * 1024; // 🚀 ميزانية صارمة: 300 ميجابايت كحد أقصى
 
     return {
         get: (index, cb) => {
@@ -37,14 +44,13 @@ function createMicroCacheStore() {
             if (!chunks[index]) {
                 chunks[index] = buf;
                 chunkKeys.push(index);
-                totalBytes += buf.length;
+                currentCacheBytes += buf.length;
 
-                // طرد أقدم القطع تباعاً لحين النزول تحت حد البايتات المسموح به،
-                // بدل عدد ثابت من القطع بغض النظر عن حجمها الفعلي
-                while (totalBytes > MAX_CACHE_BYTES && chunkKeys.length > 1) {
-                    const oldestIndex = chunkKeys.shift();
+                // التخلص الذكي من أقدم القطع بالتتابع فقط عندما نتجاوز حاجز الـ 300 ميجابايت
+                while (currentCacheBytes > MAX_CACHE_BYTES && chunkKeys.length > 0) {
+                    let oldestIndex = chunkKeys.shift();
                     if (chunks[oldestIndex]) {
-                        totalBytes -= chunks[oldestIndex].length;
+                        currentCacheBytes -= chunks[oldestIndex].length;
                         delete chunks[oldestIndex];
                     }
                 }
@@ -56,6 +62,14 @@ function createMicroCacheStore() {
     };
 }
 
+// 📈 [تحسين مضاف]: فحص وتمرير تقرير استهلاك الرام الحقيقي (RSS) إلى الـ Logs كل دقيقة للمراقبة الحية
+setInterval(() => {
+    const memoryUsage = process.memoryUsage();
+    const rssMB = (memoryUsage.rss / (1024 * 1024)).toFixed(2);
+    const heapUsedMB = (memoryUsage.heapUsed / (1024 * 1024)).toFixed(2);
+    console.log(`[Memory Monitor] Total RAM (RSS): ${rssMB} MB | Active Heap: ${heapUsedMB} MB`);
+}, 60000);
+
 function destroyEngine(infoHash) {
     const engine = activeEngines[infoHash];
     if (!engine) return;
@@ -64,7 +78,7 @@ function destroyEngine(infoHash) {
     console.log(`Cleared Engine from RAM for Hash: ${infoHash}`);
 }
 
-// 1. استقبال روابط الماغنيت وتفعيل البث عديم الحالة (Stateless)
+// 1. استقبال روابط الماغنيت
 app.post('/api/v1/torrents', (req, res) => {
     const { magnet } = req.body || {};
     if (!magnet) return res.status(400).json({ error: "Missing magnet Link" });
@@ -76,7 +90,7 @@ app.post('/api/v1/torrents', (req, res) => {
     if (!activeEngines[infoHash]) {
         let engine;
         try {
-            engine = torrentStream(magnet, { storage: createMicroCacheStore });
+            engine = torrentStream(magnet, { storage: createByteLimitStore });
         } catch (err) {
             console.error(`فشل إنشاء محرك التورنت لـ ${infoHash}:`, err.message);
             return res.status(500).json({ error: "Failed to start torrent engine" });
@@ -88,7 +102,7 @@ app.post('/api/v1/torrents', (req, res) => {
 
         engine.on('ready', () => {
             activeEngines[infoHash] = engine;
-            console.log(`Micro-Cache Torrent Ready: ${engine.torrent.name} (piece length: ${engine.torrent.pieceLength} bytes)`);
+            console.log(`Byte-Limit Adaptive Torrent Ready: ${engine.torrent.name}`);
         });
 
         setTimeout(() => destroyEngine(infoHash), 2 * 60 * 60 * 1000);
@@ -111,7 +125,7 @@ app.get('/api/v1/torrents', (req, res) => {
     res.json(result);
 });
 
-// 3. مسار البث التدفقي الصافي لـ 1DM+
+// 3. مسار البث التدفقي الصافي لـ 1DM+ مع مهلة انتظار ذكية لقفل التدفق المعلق
 app.get('/data/*', (req, res) => {
     let filePath;
     try {
@@ -167,9 +181,31 @@ app.get('/data/*', (req, res) => {
     });
 
     const stream = targetFile.createReadStream({ start, end });
-    stream.on('error', failSafely);
+
+    // ⏱️ [تحسين مضاف]: تدمير الستريم المفتوح فوراً إذا انقطع تدفق البيانات تماماً (No Seeders) لمدة 30 ثانية
+    let streamTimeout = setTimeout(() => {
+        console.error(`[Timeout] تم قطع الاتصال المعلق لـ "${filePath}" بسبب توقف تدفق البيانات من شبكة التورنت.`);
+        stream.destroy();
+        if (!res.headersSent) res.status(504).send('Torrent stream stalled (No Seeders)');
+    }, 30000);
+
+    stream.on('data', () => {
+        // إنعاش المؤقت الزمني مع كل حزمة بايتات جديدة تصل بنجاح
+        clearTimeout(streamTimeout);
+        streamTimeout = setTimeout(() => {
+            console.error(`[Timeout] انقطع التدفق فجأة أثناء التحميل لـ "${filePath}".`);
+            stream.destroy();
+        }, 30000);
+    });
+
+    stream.on('end', () => clearTimeout(streamTimeout));
+    stream.on('error', (err) => {
+        clearTimeout(streamTimeout);
+        failSafely(err);
+    });
+
     stream.pipe(res);
 });
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`Micro-Cache Streaming API running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Zero-Disk Byte-Limit API running on port ${PORT}`));
