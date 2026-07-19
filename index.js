@@ -47,13 +47,15 @@ const METADATA_TIMEOUT_MS = 30000; // إذا لم تصل بيانات التور
 // في نفس الوقت هو الخيار الآمن الوحيد - تورنتان متزامنان قد يتجاوزان الميزانية بسهولة.
 const MAX_CONCURRENT_ENGINES = parseInt(process.env.MAX_CONCURRENT_ENGINES || '1', 10);
 
-// سقف الذاكرة "اللين" (RSS بالميجابايت) - إذا تجاوزناه، يُحذف أقدم تورنت لم يُستخدم مؤخراً لتحرير مساحة.
-// مضبوط على 130MB ليطابق هدف التشغيل الآمن الإجمالي المحدد لـ Render Free Tier (512MB).
-const MAX_MEMORY_MB = parseInt(process.env.MAX_MEMORY_MB || '130', 10);
+// سقف الذاكرة "اللين" (RSS بالميجابايت) - إذا تجاوزناه ويوجد تورنت نشط، يُحذف أقدمها استخداماً لتحرير مساحة.
+// ملاحظة مهمة من المراقبة الفعلية: السيرفر يستقر عند ~127-144MB حتى بصفر تورنتات نشطة (Node + Express +
+// مكتبات torrent-stream/DHT المحمّلة في الذاكرة). لذلك رفعنا الحد إلى 200MB بدل 130MB كي يعكس الاستهلاك
+// الحقيقي للتحميل الفعلي وليس مجرد استهلاك الإقلاع الأساسي.
+const MAX_MEMORY_MB = parseInt(process.env.MAX_MEMORY_MB || '200', 10);
 
 // سقف طارئ "صارم" - إذا وصلنا هنا فالخطر حقيقي (Render يقتل العملية عند 512MB).
 // عند تجاوزه، نحذف كل التورنتات النشطة فوراً بدل الاكتفاء بحذف واحد فقط، لتفادي إعادة تشغيل قسري للسيرفر بالكامل.
-const HARD_MEMORY_MB = parseInt(process.env.HARD_MEMORY_MB || '250', 10);
+const HARD_MEMORY_MB = parseInt(process.env.HARD_MEMORY_MB || '350', 10);
 
 process.on('uncaughtException', (err) => {
     console.error('[uncaughtException] السيرفر مستمر بالعمل:', err.message);
@@ -96,8 +98,12 @@ setInterval(() => {
     if (rssMB > HARD_MEMORY_MB) {
         destroyAllEngines(`RSS ${rssMB.toFixed(2)}MB > الحد الطارئ ${HARD_MEMORY_MB}MB`);
     } else if (rssMB > MAX_MEMORY_MB) {
-        console.warn(`[Memory Monitor] تجاوزنا الحد الآمن (${MAX_MEMORY_MB} MB) - محاولة تحرير ذاكرة`);
-        evictLeastRecentlyUsed();
+        if (Object.keys(activeEngines).length > 0) {
+            console.warn(`[Memory Monitor] تجاوزنا الحد الآمن (${MAX_MEMORY_MB} MB) - محاولة تحرير ذاكرة`);
+            evictLeastRecentlyUsed();
+        }
+        // إن لم يبقَ تورنت نشط، فالذاكرة المرتفعة هي فقط heap محجوز من Node/V8 لم يُعَد بعد لنظام التشغيل -
+        // ليس هناك ما نحذفه، والتحذير المتكرر بلا فائدة حقيقية (RSS لا يعود ينخفض بمجرد الحذف، هذا سلوك طبيعي في Node)
     } else {
         processQueue(); // تأكيد دوري: استئناف الطابور تلقائياً بعد انتهاء أي فترة تهدئة
     }
