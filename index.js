@@ -17,11 +17,17 @@ process.on('unhandledRejection', (err) => {
     console.error('[unhandledRejection] السيرفر استمر بالعمل رغم هذا الخطأ:', err && err.message);
 });
 
-// 🧠 الكاش الميكروي الصارم: حماية مطلقة للرام من الانفجار مهما عظم حجم الملف
+// 🧠 كاش ميكروي يعتمد على "حجم البايتات" الفعلي بدل عدد ثابت من القطع.
+// السبب: حجم القطعة (piece length) يختلف من تورنت لآخر (قد يصل حتى 16 ميجابايت
+// بالملفات الضخمة)، فحد ثابت مثل "4 قطع" قد يعني أحياناً 4 ميجا فقط، وأحياناً
+// أخرى 64 ميجا — بينما هدفنا الحقيقي هو تحديد استهلاك الرام بالبايت مباشرة،
+// بغض النظر عن حجم القطعة، لضمان هامش أمان كافٍ يمنع حذف قطعة قبل قراءتها
+const MAX_CACHE_BYTES = 300 * 1024 * 1024; // ~300 ميجابايت (هامش آمن ضمن حد Render المجاني 512MB)
+
 function createMicroCacheStore() {
     let chunks = {};
     let chunkKeys = [];
-    const MAX_CHUNKS = 4; // 🚀 4 قطع فقط كحد أقصى! تضمن بقاء استهلاك الرام تحت حاجز 30 ميجابايت دائماً
+    let totalBytes = 0;
 
     return {
         get: (index, cb) => {
@@ -31,11 +37,16 @@ function createMicroCacheStore() {
             if (!chunks[index]) {
                 chunks[index] = buf;
                 chunkKeys.push(index);
-                
-                // طرد فوري لأي قطعة قديمة بمجرد دخول قطعة جديدة ليبقى الاستهلاك ثابتاً
-                if (chunkKeys.length > MAX_CHUNKS) {
-                    let oldestIndex = chunkKeys.shift();
-                    delete chunks[oldestIndex];
+                totalBytes += buf.length;
+
+                // طرد أقدم القطع تباعاً لحين النزول تحت حد البايتات المسموح به،
+                // بدل عدد ثابت من القطع بغض النظر عن حجمها الفعلي
+                while (totalBytes > MAX_CACHE_BYTES && chunkKeys.length > 1) {
+                    const oldestIndex = chunkKeys.shift();
+                    if (chunks[oldestIndex]) {
+                        totalBytes -= chunks[oldestIndex].length;
+                        delete chunks[oldestIndex];
+                    }
                 }
             }
             cb(null);
@@ -77,7 +88,7 @@ app.post('/api/v1/torrents', (req, res) => {
 
         engine.on('ready', () => {
             activeEngines[infoHash] = engine;
-            console.log(`Micro-Cache Torrent Ready: ${engine.torrent.name}`);
+            console.log(`Micro-Cache Torrent Ready: ${engine.torrent.name} (piece length: ${engine.torrent.pieceLength} bytes)`);
         });
 
         setTimeout(() => destroyEngine(infoHash), 2 * 60 * 60 * 1000);
