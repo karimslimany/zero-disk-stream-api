@@ -5,10 +5,15 @@ const memoryStore = require('memory-chunk-store');
 
 const app = express();
 
-const ALLOWED_ORIGIN = "https://karimslimany.workers.dev";
+// أكثر من مصدر مسموح: نطاق الـ Cloudflare Worker، ونطاق السيرفر نفسه على Render
+// (هذا الأخير مطلوب لأن فتح الرابط مباشرة داخل متصفح 1DM+ يرسل Origin = نطاق السيرفر نفسه)
+const ALLOWED_ORIGINS = [
+    "https://karimslimany.workers.dev",
+    "https://zero-disk-stream-api-tlad.onrender.com"
+];
 app.use(cors({
     origin: (origin, callback) => {
-        if (!origin || origin === ALLOWED_ORIGIN) {
+        if (!origin || ALLOWED_ORIGINS.includes(origin)) {
             callback(null, true);
         } else {
             // نسجّل القيمة الفعلية المرفوضة حتى نعرف مصدرها بدل تخمينها من اللوغ فقط
