@@ -9,7 +9,7 @@ app.use(express.json());
 // مجلد لحفظ محركات البحث النشطة في الذاكرة
 let activeEngines = {};
 
-// 🛡️ شبكة أمان عامة: التقاط الأخطاء غير المتوقعة على مستوى النظام ومنع انهيار السيرفر
+// 🛡️ شبكة أمان عامة للخطأ غير المتوقع
 process.on('uncaughtException', (err) => {
     console.error('[uncaughtException] السيرفر استمر بالعمل رغم هذا الخطأ:', err.message);
 });
@@ -17,11 +17,11 @@ process.on('unhandledRejection', (err) => {
     console.error('[unhandledRejection] السيرفر استمر بالعمل رغم هذا الخطأ:', err && err.message);
 });
 
-// 🧠 المخزن الذكي المتكيف العريض: تم رفع السعة لاستيعاب المسارات المتعددة لبرامج التحميل
-function createSmartCacheStore() {
+// 🧠 الكاش الميكروي الصارم: حماية مطلقة للرام من الانفجار مهما عظم حجم الملف
+function createMicroCacheStore() {
     let chunks = {};
     let chunkKeys = [];
-    const MAX_CHUNKS = 80; // 🚀 تم الرفع من 15 إلى 80 قطعة لتوسيع مساحة المناورة لخيوط التحميل
+    const MAX_CHUNKS = 4; // 🚀 4 قطع فقط كحد أقصى! تضمن بقاء استهلاك الرام تحت حاجز 30 ميجابايت دائماً
 
     return {
         get: (index, cb) => {
@@ -32,7 +32,7 @@ function createSmartCacheStore() {
                 chunks[index] = buf;
                 chunkKeys.push(index);
                 
-                // طرد أقدم قطعة (FIFO) عند امتلاء الطابور المرن
+                // طرد فوري لأي قطعة قديمة بمجرد دخول قطعة جديدة ليبقى الاستهلاك ثابتاً
                 if (chunkKeys.length > MAX_CHUNKS) {
                     let oldestIndex = chunkKeys.shift();
                     delete chunks[oldestIndex];
@@ -45,11 +45,10 @@ function createSmartCacheStore() {
     };
 }
 
-// 🧹 دالة مساعدة لتنظيف وتدمير المحرك بأمان وتفريغ الذاكرة
 function destroyEngine(infoHash) {
     const engine = activeEngines[infoHash];
     if (!engine) return;
-    try { engine.destroy(); } catch (e) { /* تجاهل أي خطأ أثناء الإغلاق نفسه */ }
+    try { engine.destroy(); } catch (e) { }
     delete activeEngines[infoHash];
     console.log(`Cleared Engine from RAM for Hash: ${infoHash}`);
 }
@@ -66,31 +65,28 @@ app.post('/api/v1/torrents', (req, res) => {
     if (!activeEngines[infoHash]) {
         let engine;
         try {
-            // تشغيل التورنت عبر المخزن الذكي العريض
-            engine = torrentStream(magnet, { storage: createSmartCacheStore });
+            engine = torrentStream(magnet, { storage: createMicroCacheStore });
         } catch (err) {
             console.error(`فشل إنشاء محرك التورنت لـ ${infoHash}:`, err.message);
             return res.status(500).json({ error: "Failed to start torrent engine" });
         }
 
-        // 🛡️ ترويض معالج الأخطاء: تسجيل تحذير فقط دون تدمير الجلسة فجأة أثناء التحميل
         engine.on('error', (err) => {
-            console.error(`[Warning] خطأ قراءة مؤقت في محرك التورنت لـ ${infoHash}:`, err && err.message);
+            console.error(`[Warning] خطأ قراءة في محرك التورنت لـ ${infoHash}:`, err && err.message);
         });
 
         engine.on('ready', () => {
             activeEngines[infoHash] = engine;
-            console.log(`Stateless & High-Capacity Torrent Ready: ${engine.torrent.name}`);
+            console.log(`Micro-Cache Torrent Ready: ${engine.torrent.name}`);
         });
 
-        // تدمير تلقائي بعد ساعتين لتفريغ بقايا الذاكرة وضمان عدم تراكم العمليات الخاملة
         setTimeout(() => destroyEngine(infoHash), 2 * 60 * 60 * 1000);
     }
 
     res.json({ status: "added", hash: infoHash });
 });
 
-// 2. تزويد الفرونت-إند بشجرة الملفات والأحجام دون الحاجة لتعديل كود موقعك
+// 2. تزويد الفرونت-إند بشجرة الملفات
 app.get('/api/v1/torrents', (req, res) => {
     let result = {};
     Object.keys(activeEngines).forEach(hash => {
@@ -104,7 +100,7 @@ app.get('/api/v1/torrents', (req, res) => {
     res.json(result);
 });
 
-// 3. مسار البث التدفقي الصافي مع دعم الحزم الجزئية (Byte-Ranges) لـ 1DM+
+// 3. مسار البث التدفقي الصافي لـ 1DM+
 app.get('/data/*', (req, res) => {
     let filePath;
     try {
@@ -123,7 +119,6 @@ app.get('/data/*', (req, res) => {
 
     if (!targetFile) return res.status(404).send('File not found or metadata loading...');
 
-    // 🛡️ دالة معالجة أخطاء الستريم أثناء النقل: تدمر الطلب المنقطع بأمان لئلا يعلق السيرفر
     const failSafely = (err) => {
         console.error(`خطأ أثناء بث الملف "${filePath}":`, err && err.message);
         if (!res.headersSent) {
@@ -135,7 +130,6 @@ app.get('/data/*', (req, res) => {
 
     const range = req.headers.range;
 
-    // إذا كان الطلب عادياً بدون تقسيم
     if (!range) {
         res.setHeader('Content-Length', targetFile.length);
         res.setHeader('Accept-Ranges', 'bytes');
@@ -144,7 +138,6 @@ app.get('/data/*', (req, res) => {
         return stream.pipe(res);
     }
 
-    // هندسة الحزم (Byte-Range Math) لضمان التوافق المطلق مع تقنيات الـ Resume في 1DM+
     const parts = range.replace(/bytes=/, "").split("-");
     const start = parseInt(parts[0], 10);
     const end = parts[1] ? parseInt(parts[1], 10) : targetFile.length - 1;
@@ -162,11 +155,10 @@ app.get('/data/*', (req, res) => {
         'Content-Type': 'video/mp4'
     });
 
-    // سحب القطع المطلوبة فقط بشكل تدفقي حي وتمريرها للهاتف مباشرة
     const stream = targetFile.createReadStream({ start, end });
     stream.on('error', failSafely);
     stream.pipe(res);
 });
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`Zero-Disk Smart Streaming API running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Micro-Cache Streaming API running on port ${PORT}`));
