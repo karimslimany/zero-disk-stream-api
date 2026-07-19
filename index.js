@@ -1,407 +1,186 @@
-const express = require('express');
-const cors = require('cors');
-const torrentStream = require('torrent-stream');
-const memoryStore = require('memory-chunk-store');
+'use strict';
 
-const app = express();
+/**
+ * sliding-window-store.js
+ * -------------------------------------------------------------------------
+ * بديل عن memory-chunk-store مصمم خصيصاً لبث الفيديو بذاكرة محدودة.
+ *
+ * الفرق الجوهري عن memory-chunk-store:
+ *   - memory-chunk-store: يقبل أي قطعة (chunk) تصل من الشبكة ويحتفظ بها للأبد
+ *     في مصفوفة، فحجم الذاكرة يكبر خطياً مع حجم الملف كاملاً.
+ *   - SlidingWindowStore: يحتفظ فقط بنافذة محدودة من القطع حول "رأس التشغيل"
+ *     الفعلي (byte offset الذي يُبَث للعميل الآن)، ويحذف القطع الأقدم فوراً،
+ *     ويؤخّر (backpressure) قبول القطع الأحدث مما يسمح به إن كانت بعيدة جداً
+ *     أمام رأس التشغيل - بدل تركها تتكدس في الذاكرة أثناء تحميلها من الشبكة.
+ *
+ * هذا يجعل الذاكرة المستهلكة تقريباً ثابتة ومحدَّدة صراحةً بالميجابايت عبر
+ * CHUNK_WINDOW_AHEAD_MB و CHUNK_WINDOW_BEHIND_MB (وليس بعدد قطع ثابت - لأن حجم
+ * القطعة نفسه يتغيّر حسب حجم التورنت، فعدد قطع ثابت لا يعطي سقف ذاكرة موثوق)،
+ * بغض النظر عن حجم أو مدة الملف بالكامل.
+ *
+ * ملاحظة أمانة تقنية مهمة:
+ * تأخير استدعاء الـ callback داخل put() هو ما يخلق الضغط الخلفي (backpressure)
+ * الذي يمنع محرك التورنت من طلب المزيد من القطع من الشبكة بلا حدود. هذا السلوك
+ * يعتمد على أن torrent-stream/bittorrent-swarm ينتظران فعلاً انتهاء put() قبل
+ * تحرير "خانة الطلب" (request slot) الخاصة بتلك القطعة - وهذا صحيح في التطبيقات
+ * الشائعة لواجهة chunk-store، لكنه غير موثّق رسمياً كضمان صارم 100%. يُنصح
+ * باختبار هذا فعلياً تحت حمل حقيقي (تنزيل + بث متزامن) قبل الاعتماد عليه إنتاجياً،
+ * وأن يبقى HARD_MEMORY_MB (الموجود أصلاً في index.js) كشبكة أمان أخيرة.
+ */
 
-// أكثر من مصدر مسموح: نطاق الـ Cloudflare Worker، ونطاق السيرفر نفسه على Render
-// (هذا الأخير مطلوب لأن فتح الرابط مباشرة داخل متصفح 1DM+ يرسل Origin = نطاق السيرفر نفسه)
-const ALLOWED_ORIGINS = [
-    "https://karimslimany.workers.dev",
-    "https://zero-disk-stream-api-tlad.onrender.com"
-];
-app.use(cors({
-    origin: (origin, callback) => {
-        if (!origin || ALLOWED_ORIGINS.includes(origin)) {
-            callback(null, true);
-        } else {
-            // نسجّل القيمة الفعلية المرفوضة حتى نعرف مصدرها بدل تخمينها من اللوغ فقط
-            console.warn(`[CORS] طلب مرفوض من Origin غير مسموح: "${origin}"`);
-            callback(new Error('Blocked by Security: Unauthorized Origin'));
+const EventEmitter = require('events');
+
+function pieceIndexForByte(byteOffset, chunkLength) {
+    return Math.floor(byteOffset / chunkLength);
+}
+
+class SlidingWindowStore extends EventEmitter {
+    constructor(chunkLength, opts) {
+        super();
+        opts = opts || {};
+
+        this.chunkLength = chunkLength;
+        this.length = opts.length || 0;
+        this.closed = false;
+
+        // خريطة index -> Buffer، بدل مصفوفة كاملة الحجم كما في memory-chunk-store
+        this.chunks = new Map();
+
+        // "رأس التشغيل" الحالي بوحدة رقم القطعة - يُحدَّث من الخارج عبر setPlayheadByte
+        // كلما بُثّت بايتات فعلية للعميل (انظر ربطها بـ /data/* في index.js)
+        this.playheadIndex = 0;
+
+        // *** مهم: النافذة تُحدَّد بالميجابايت وليس بعدد القطع ***
+        // حجم القطعة (piece length) في BitTorrent يتغيّر تلقائياً حسب حجم التورنت الكلي:
+        // قد يكون 256KB لتورنت صغير، وقد يصل إلى 4-16MB لتورنت ضخم (عدة جيجابايت).
+        // فلو ثبّتنا "عدد القطع" بدل الحجم، فإن 20 قطعة قد تعني 5MB في حالة وتعني
+        // 300+MB في حالة أخرى - أي لا ضمان فعلي لسقف الذاكرة. لذلك نحسب الميزانية
+        // بالبايت أولاً، ثم نشتق عدد القطع المقابل من chunkLength الفعلي لهذا التورنت.
+        const aheadMB = opts.aheadWindowMB || parseFloat(process.env.CHUNK_WINDOW_AHEAD_MB || '40');
+        const behindMB = opts.behindWindowMB || parseFloat(process.env.CHUNK_WINDOW_BEHIND_MB || '20');
+        const aheadBytes = aheadMB * 1024 * 1024;
+        const behindBytes = behindMB * 1024 * 1024;
+
+        // على الأقل قطعة واحدة أمام رأس التشغيل - وإلا يتوقف البث تماماً (لا نستطيع تخزين صفر قطع)
+        this.aheadWindow = Math.max(1, Math.floor(aheadBytes / chunkLength));
+        this.behindWindow = Math.max(0, Math.floor(behindBytes / chunkLength));
+
+        // تحذير صريح: إن كانت القطعة الواحدة أكبر من ميزانية الأمام المحددة، فسقف الذاكرة
+        // الفعلي لهذا التورنت سيكون أعلى مما طلبته (لأننا لا نستطيع تخزين أقل من قطعة واحدة).
+        // هذا وارد فقط مع تورنتات ضخمة جداً بقطع كبيرة جداً - راقب [Memory Monitor] في هذه الحالة.
+        if (chunkLength > aheadBytes) {
+            console.warn(
+                `[SlidingWindowStore] تحذير: حجم القطعة (${(chunkLength / 1024 / 1024).toFixed(2)}MB) ` +
+                `أكبر من ميزانية النافذة الأمامية المطلوبة (${aheadMB}MB). ` +
+                `الحد الأدنى الفعلي للذاكرة سيكون قطعة واحدة = ${(chunkLength / 1024 / 1024).toFixed(2)}MB بدل ${aheadMB}MB.`
+            );
+        }
+
+        console.log(
+            `[SlidingWindowStore] chunkLength=${(chunkLength / 1024).toFixed(0)}KB | ` +
+            `aheadWindow=${this.aheadWindow} قطعة (~${aheadMB}MB) | ` +
+            `behindWindow=${this.behindWindow} قطعة (~${behindMB}MB) | ` +
+            `سقف الذاكرة التقريبي لهذا التورنت ≈ ${(((this.aheadWindow + this.behindWindow + 1) * chunkLength) / 1024 / 1024).toFixed(1)}MB`
+        );
+
+        // القطع التي وصلت من الشبكة لكنها أبعد من المسموح - callback الخاص بها مؤجل عمداً
+        this._pendingPuts = [];
+    }
+
+    // يُستدعى من نقطة بث /data/* في index.js عند كل دفعة بيانات فعلية تُرسل للعميل
+    setPlayheadByte(byteOffset) {
+        const idx = pieceIndexForByte(byteOffset, this.chunkLength);
+        if (idx > this.playheadIndex) {
+            this.playheadIndex = idx;
+            this._evictBehind();
+            this._releasePendingPuts();
         }
     }
-}));
-app.use(express.json());
 
-const APP_SECRET = process.env.APP_SECRET || "Karim_Secure_Streaming_2026_X";
-
-function requireSecret(req, res, next) {
-    const provided = req.headers['x-api-token'];
-    if (provided !== APP_SECRET) {
-        return res.status(401).json({ error: "Unauthorized: Missing or invalid secret token" });
-    }
-    next();
-}
-
-let activeEngines = {};
-let engineStatus = {}; // hash -> { state: 'loading'|'ready'|'failed', error?: string, lastAccess?: number }
-let pendingQueue = []; // [{ infoHash, magnet, queuedAt }] - طلبات تنتظر دورها لأن MAX_CONCURRENT_ENGINES ممتلئ
-let hardFlushCooldownUntil = 0; // بعد تنظيف طارئ، نمنع الطابور من إعادة الملء الفوري ليهدأ الاستخدام الفعلي للذاكرة (GC)
-
-const METADATA_TIMEOUT_MS = 30000; // إذا لم تصل بيانات التورنت خلال 30 ثانية، اعتبره فاشلاً بدل تعليقه للأبد
-
-// عدد التورنتات النشطة المسموح بها في نفس الوقت - كل واحد يخزن بياناته في الـ RAM
-// (التخزين المستخدم هو memory-chunk-store، فكل ميجا تُحمَّل تبقى في الذاكرة حتى تدمير المحرك)
-// على Render Free Tier (512MB RAM إجمالي)، وميزانية الكاش المحددة بـ 50MB فقط، تورنت واحد نشط
-// في نفس الوقت هو الخيار الآمن الوحيد - تورنتان متزامنان قد يتجاوزان الميزانية بسهولة.
-const MAX_CONCURRENT_ENGINES = parseInt(process.env.MAX_CONCURRENT_ENGINES || '1', 10);
-
-// سقف الذاكرة "اللين" (RSS بالميجابايت) - إذا تجاوزناه ويوجد تورنت نشط، يُحذف أقدمها استخداماً لتحرير مساحة.
-// ملاحظة مهمة من المراقبة الفعلية: السيرفر يستقر عند ~127-144MB حتى بصفر تورنتات نشطة (Node + Express +
-// مكتبات torrent-stream/DHT المحمّلة في الذاكرة). لذلك رفعنا الحد إلى 200MB بدل 130MB كي يعكس الاستهلاك
-// الحقيقي للتحميل الفعلي وليس مجرد استهلاك الإقلاع الأساسي.
-const MAX_MEMORY_MB = parseInt(process.env.MAX_MEMORY_MB || '200', 10);
-
-// مهلة اعتبار البث "متوقفاً" - رُفعت من 30 إلى 90 ثانية افتراضياً. السبب: عند نت غير مستقر لدى العميل،
-// Node.js يطبّق backpressure فيتوقف حدث 'data' عن الإطلاق بسبب بطء العميل نفسه وليس توقف التورنت -
-// مهلة قصيرة جداً كانت تقتل البث ظلماً في هذه الحالة بالضبط.
-const STREAM_STALL_TIMEOUT_MS = parseInt(process.env.STREAM_STALL_TIMEOUT_MS || '90000', 10);
-
-// بعد كم من عدم النشاط (لا طلبات بث) يُعتبر التورنت مهجوراً ويُحذف - وليس وقتاً ثابتاً منذ الإنشاء
-const IDLE_ENGINE_TIMEOUT_MS = parseInt(process.env.IDLE_ENGINE_TIMEOUT_MS || (2 * 60 * 60 * 1000), 10);
-
-// سقف طارئ "صارم" - إذا وصلنا هنا فالخطر حقيقي (Render يقتل العملية عند 512MB).
-// عند تجاوزه، نحذف كل التورنتات النشطة فوراً بدل الاكتفاء بحذف واحد فقط، لتفادي إعادة تشغيل قسري للسيرفر بالكامل.
-const HARD_MEMORY_MB = parseInt(process.env.HARD_MEMORY_MB || '350', 10);
-
-process.on('uncaughtException', (err) => {
-    console.error('[uncaughtException] السيرفر مستمر بالعمل:', err.message);
-});
-process.on('unhandledRejection', (err) => {
-    console.error('[unhandledRejection] السيرفر مستمر بالعمل:', err && err.message);
-});
-
-function evictLeastRecentlyUsed(excludeHash) {
-    let oldestHash = null;
-    let oldestTime = Infinity;
-    Object.keys(activeEngines).forEach(hash => {
-        if (hash === excludeHash) return;
-        const t = (engineStatus[hash] && engineStatus[hash].lastAccess) || 0;
-        if (t < oldestTime) {
-            oldestTime = t;
-            oldestHash = hash;
+    _evictBehind() {
+        const floor = this.playheadIndex - this.behindWindow;
+        if (floor <= 0) return;
+        for (const idx of this.chunks.keys()) {
+            if (idx < floor) this.chunks.delete(idx);
         }
-    });
-    if (oldestHash) {
-        console.log(`[LRU] تحرير الذاكرة: حذف التورنت الأقل استخداماً ${oldestHash}`);
-        destroyEngine(oldestHash);
-        return true;
     }
-    return false;
-}
 
-function sweepIdleEngines() {
-    const now = Date.now();
-    Object.keys(activeEngines).forEach(hash => {
-        const status = engineStatus[hash];
-        // لا تحذف تورنتاً لا يزال في مرحلة "loading" (له مهلته الخاصة عبر metadataTimer)
-        if (!status || status.state !== 'ready') return;
-        const idleFor = now - (status.lastAccess || 0);
-        if (idleFor > IDLE_ENGINE_TIMEOUT_MS) {
-            console.log(`[Idle Cleanup] حذف ${hash} بعد ${Math.round(idleFor / 60000)} دقيقة من عدم النشاط`);
-            destroyEngine(hash);
+    _releasePendingPuts() {
+        // بعد تقدم رأس التشغيل قد تتحرر مساحة ضمن النافذة الأمامية - أفرج عن القطع المعلّقة بالترتيب
+        this._pendingPuts.sort((a, b) => a.index - b.index);
+        while (
+            this._pendingPuts.length &&
+            (this._pendingPuts[0].index - this.playheadIndex) <= this.aheadWindow
+        ) {
+            const p = this._pendingPuts.shift();
+            this.chunks.set(p.index, p.buf);
+            p.cb(null);
         }
-    });
-}
-function destroyAllEngines(reason) {
-    const hashes = Object.keys(activeEngines);
-    console.error(`[HARD LIMIT] ${reason} - تدمير جميع التورنتات النشطة (${hashes.length}) فوراً لتفادي قتل العملية من طرف Render`);
-    hardFlushCooldownUntil = Date.now() + 15000; // امنح 15 ثانية للذاكرة كي تهدأ فعلياً قبل قبول طلب جديد من الطابور
-    hashes.forEach(hash => destroyEngine(hash));
-}
+    }
 
-setInterval(() => {
-    const memoryUsage = process.memoryUsage();
-    const rssMB = memoryUsage.rss / (1024 * 1024);
-    console.log(`[Memory Monitor] Total RAM (RSS): ${rssMB.toFixed(2)} MB | Active torrents: ${Object.keys(activeEngines).length}`);
-
-    if (rssMB > HARD_MEMORY_MB) {
-        destroyAllEngines(`RSS ${rssMB.toFixed(2)}MB > الحد الطارئ ${HARD_MEMORY_MB}MB`);
-    } else if (rssMB > MAX_MEMORY_MB) {
-        if (Object.keys(activeEngines).length > 0) {
-            console.warn(`[Memory Monitor] تجاوزنا الحد الآمن (${MAX_MEMORY_MB} MB) - محاولة تحرير ذاكرة`);
-            evictLeastRecentlyUsed();
+    put(index, buf, cb) {
+        cb = cb || function () {};
+        if (this.closed) {
+            return process.nextTick(() => cb(new Error('Storage closed')));
         }
-        // إن لم يبقَ تورنت نشط، فالذاكرة المرتفعة هي فقط heap محجوز من Node/V8 لم يُعَد بعد لنظام التشغيل -
-        // ليس هناك ما نحذفه، والتحذير المتكرر بلا فائدة حقيقية (RSS لا يعود ينخفض بمجرد الحذف، هذا سلوك طبيعي في Node)
-    } else {
-        processQueue(); // تأكيد دوري: استئناف الطابور تلقائياً بعد انتهاء أي فترة تهدئة
-    }
-    sweepIdleEngines(); // احذف فقط ما كان خاملاً فعلاً منذ فترة طويلة - وليس وقتاً ثابتاً منذ الإنشاء
-}, 10000); // كل 10 ثواني بدل 60 - على بيئة بهذا الضيق (512MB)، الذاكرة قد ترتفع بسرعة أثناء البث
 
-function destroyEngine(infoHash) {
-    const engine = activeEngines[infoHash];
-    if (!engine) return;
-    try { engine.destroy(); } catch (e) { }
-    delete activeEngines[infoHash];
-    delete engineStatus[infoHash];
-    console.log(`Cleared Engine from RAM for Hash: ${infoHash}`);
-    processQueue(); // حرّرنا مكاناً - شغّل التالي في الطابور إن وُجد
-}
-
-function failEngine(infoHash, reason) {
-    const engine = activeEngines[infoHash];
-    if (engine) {
-        try { engine.destroy(); } catch (e) { }
-    }
-    delete activeEngines[infoHash];
-    engineStatus[infoHash] = { state: 'failed', error: reason };
-    console.error(`[FAILED] لم يتم العثور على بيانات/سيدرز لـ ${infoHash}: ${reason}`);
-    processQueue(); // حرّرنا مكاناً هنا أيضاً
-}
-
-// يبدأ محرك تورنت فعلياً لهذا الـ hash؛ يُستدعى إما مباشرة (يوجد مكان شاغر) أو من الطابور عند تحرر مكان
-function startEngine(infoHash, magnet) {
-    let engine;
-    try {
-        // *** الاختلاف الوحيد المتعمد في هذا الاختبار: التخزين الأصلي بدل الكاش المخصص ***
-        engine = torrentStream(magnet, { storage: memoryStore });
-    } catch (err) {
-        console.error(`فشل إنشاء محرك التورنت لـ ${infoHash}:`, err.message);
-        engineStatus[infoHash] = { state: 'failed', error: err.message };
-        processQueue();
-        return;
-    }
-
-    engineStatus[infoHash] = { state: 'loading', lastAccess: Date.now() };
-    activeEngines[infoHash] = engine; // نخزنه فوراً حتى تظهر حالة "التحميل" في GET
-
-    engine.on('error', (err) => {
-        console.error(`[Engine Error] خطأ في محرك التورنت لـ ${infoHash}:`, err && err.message);
-        failEngine(infoHash, err && err.message);
-    });
-
-    // تسجيل أي نشاط شبكة نراه فعلياً، لمعرفة هل هناك اتصال بالـ swarm أصلاً
-    engine.on('torrent', () => console.log(`[DEBUG] تم استقبال بيانات التورنت الأساسية لـ ${infoHash}`));
-    engine.swarm && engine.swarm.on && engine.swarm.on('wire', (wire) => {
-        console.log(`[DEBUG] اتصال جديد بنظير (peer) لـ ${infoHash}: ${wire.remoteAddress || 'unknown'}`);
-    });
-
-    // إذا لم تصل بيانات التورنت (metadata) خلال المهلة، لا تتركه معلقاً - أفشله بوضوح
-    const metadataTimer = setTimeout(() => {
-        if (engineStatus[infoHash] && engineStatus[infoHash].state === 'loading') {
-            failEngine(infoHash, 'No seeders / trackers unreachable within timeout');
+        const distanceAhead = index - this.playheadIndex;
+        if (distanceAhead > this.aheadWindow) {
+            // هذه القطعة أبعد مما نريد تخزينه الآن - لا تُخزَّن ولا يُستدعى cb بعد.
+            // هذا التأخير هو آلية الضغط الخلفي التي تمنع تكدس الذاكرة.
+            this._pendingPuts.push({ index, buf, cb });
+            return;
         }
-    }, METADATA_TIMEOUT_MS);
 
-    engine.on('ready', () => {
-        clearTimeout(metadataTimer);
-        activeEngines[infoHash] = engine;
-        engineStatus[infoHash] = { state: 'ready', lastAccess: Date.now() };
+        this.chunks.set(index, buf);
+        this._evictBehind();
+        process.nextTick(() => cb(null));
+    }
 
-        // مهم لمنع اختناق الذاكرة: بدون هذا، torrent-stream يحمّل كل ملفات التورنت
-        // (مثلاً كل حلقات موسم كامل) إلى الـ RAM دفعة واحدة، حتى لو المستخدم يريد ملفاً واحداً فقط
-        engine.files.forEach(f => f.deselect());
+    get(index, opts, cb) {
+        if (typeof opts === 'function') {
+            cb = opts;
+            opts = {};
+        }
+        opts = opts || {};
+        if (this.closed) {
+            return process.nextTick(() => cb(new Error('Storage closed')));
+        }
 
-        console.log(`[SUCCESS] Torrent Ready in RAM: ${engine.torrent.name} (${engine.files.length} ملفات، لا شيء محدد للتحميل بعد)`);
-    });
+        const buf = this.chunks.get(index);
+        if (!buf) {
+            // إما لم تصل القطعة بعد من الشبكة، أو حُذفت لأنها أقدم من نافذة التشغيل.
+            // نُرجع خطأً - وهو السلوك المتوقع من واجهة chunk-store عند غياب القطعة.
+            return process.nextTick(() =>
+                cb(new Error('Chunk not found (evicted or not downloaded yet)'))
+            );
+        }
 
-    // ملاحظة: لا نضع هنا مؤقت حذف ثابت منذ الإنشاء - المسح الدوري لعدم النشاط (انظر IDLE_ENGINE_TIMEOUT_MS
-    // أدناه في المراقب الدوري) هو من يقرر الحذف بناءً على آخر استخدام فعلي، وليس وقتاً ثابتاً قد يقطع تحميلاً نشطاً
-}
+        let out = buf;
+        if (opts.offset || opts.length) {
+            const start = opts.offset || 0;
+            const end = opts.length ? start + opts.length : buf.length;
+            out = buf.slice(start, end);
+        }
+        process.nextTick(() => cb(null, out));
+    }
 
-// يأخذ العنصر التالي من الطابور ويشغّله، بشرط وجود مكان شاغر - بهذا تُعالج طلبات 1DM+ المتعددة بالدور تلقائياً
-function processQueue() {
-    if (Date.now() < hardFlushCooldownUntil) return; // ما زلنا في فترة التهدئة بعد تنظيف طارئ - لا تبدأ شيئاً جديداً بعد
-    while (pendingQueue.length > 0 && Object.keys(activeEngines).length < MAX_CONCURRENT_ENGINES) {
-        const next = pendingQueue.shift();
-        // تخطَّ أي عنصر أصبح نشطاً بالفعل بطريقة أخرى (احتياط ضد حالات نادرة)
-        if (activeEngines[next.infoHash]) continue;
-        console.log(`[Queue] بدء تشغيل الطلب التالي من الطابور: ${next.infoHash} (تبقّى ${pendingQueue.length} في الانتظار)`);
-        startEngine(next.infoHash, next.magnet);
+    close(cb) {
+        this.closed = true;
+        this.chunks.clear();
+        this._pendingPuts.forEach((p) => p.cb(new Error('Storage closed')));
+        this._pendingPuts = [];
+        process.nextTick(() => cb && cb(null));
+    }
+
+    destroy(cb) {
+        this.close(cb);
     }
 }
 
-app.post('/api/v1/torrents', requireSecret, (req, res) => {
-    const { magnet } = req.body || {};
-    if (!magnet) return res.status(400).json({ error: "Missing magnet Link" });
-
-    let hashMatch = magnet.match(/btih:([a-zA-Z0-9]{32,40})/i);
-    if (!hashMatch) return res.status(400).json({ error: "Invalid magnet hash" });
-    let infoHash = hashMatch[1].toLowerCase();
-
-    console.log(`[DEBUG] بدء إضافة التورنت: ${infoHash}`);
-
-    // موجود مسبقاً (نشط بالفعل) - لا تُعِد إنشاءه، فقط أبلغ حالته الحالية
-    if (activeEngines[infoHash]) {
-        const status = engineStatus[infoHash] || { state: 'loading' };
-        return res.json({ status: status.state, hash: infoHash });
-    }
-
-    // موجود مسبقاً في الطابور - أبلغ موقعه بدل تكراره
-    if (pendingQueue.some(item => item.infoHash === infoHash)) {
-        const pos = pendingQueue.findIndex(item => item.infoHash === infoHash) + 1;
-        return res.json({ status: "queued", hash: infoHash, position: pos, queueLength: pendingQueue.length });
-    }
-
-    // نضيفه دائماً للطابور أولاً (حتى لو يوجد مكان شاغر) للحفاظ على الترتيب FIFO
-    // ثم نعالج الطابور فوراً - إن كان شاغراً سيبدأ هذا الطلب في نفس اللحظة عملياً
-    pendingQueue.push({ infoHash, magnet, queuedAt: Date.now() });
-    processQueue();
-
-    if (activeEngines[infoHash]) {
-        return res.json({ status: "added", hash: infoHash });
-    }
-    const position = pendingQueue.findIndex(item => item.infoHash === infoHash) + 1;
-    console.log(`[Queue] ${infoHash} في الانتظار بالموقع ${position} (الحد ${MAX_CONCURRENT_ENGINES} تورنت متزامن)`);
-    res.json({ status: "queued", hash: infoHash, position, queueLength: pendingQueue.length });
-});
-
-app.get('/api/v1/torrents', requireSecret, (req, res) => {
-    let result = {};
-
-    Object.keys(activeEngines).forEach(hash => {
-        const engine = activeEngines[hash];
-        const status = engineStatus[hash] || { state: 'loading' };
-        result[hash] = {
-            Hash: hash,
-            Status: status.state,
-            Name: engine.torrent ? engine.torrent.name : "Loading Metadata...",
-            Files: engine.files ? engine.files.map(f => ({ Path: f.path, Length: f.length })) : []
-        };
-    });
-
-    // أظهر أيضاً التورنتات التي فشلت، حتى يعرف العميل أنه يجب التوقف عن الانتظار
-    Object.keys(engineStatus).forEach(hash => {
-        if (engineStatus[hash].state === 'failed' && !result[hash]) {
-            result[hash] = {
-                Hash: hash,
-                Status: 'failed',
-                Error: engineStatus[hash].error || 'Unknown error',
-                Name: null,
-                Files: []
-            };
-        }
-    });
-
-    // أظهر عناصر الطابور مع ترتيب انتظارها - مهم لـ 1DM+ عند جدولة عدة تنزيلات دفعة واحدة
-    pendingQueue.forEach((item, index) => {
-        result[item.infoHash] = {
-            Hash: item.infoHash,
-            Status: 'queued',
-            Position: index + 1,
-            Name: null,
-            Files: []
-        };
-    });
-
-    res.json(result);
-});
-
-app.get('/data/*', (req, res) => {
-    let filePath;
-    try {
-        filePath = decodeURIComponent(req.params[0]);
-    } catch (err) {
-        return res.status(400).send('Invalid file path');
-    }
-
-    let targetFile = null;
-    let ownerHash = null;
-    Object.entries(activeEngines).forEach(([hash, engine]) => {
-        if (engine.files) {
-            let f = engine.files.find(file => file.path === filePath);
-            if (f) { targetFile = f; ownerHash = hash; }
-        }
-    });
-
-    if (!targetFile) return res.status(404).send('File not found or metadata loading...');
-
-    // حدّث وقت آخر استخدام حتى لا يُحذف هذا التورنت بواسطة نظام تحرير الذاكرة (LRU) أثناء المشاهدة
-    if (ownerHash && engineStatus[ownerHash]) {
-        engineStatus[ownerHash].lastAccess = Date.now();
-    }
-
-    // اختر هذا الملف فقط للتحميل الفعلي؛ هذا يمنع تحميل باقي ملفات التورنت (مثلاً حلقات أخرى) إلى الذاكرة
-    targetFile.select();
-
-    const failSafely = (err) => {
-        console.error(`خطأ أثناء بث الملف "${filePath}":`, err && err.message);
-        if (!res.headersSent) {
-            res.status(502).send('Streaming failed, please try again');
-        } else {
-            res.destroy();
-        }
-    };
-
-    const range = req.headers.range;
-
-    if (!range) {
-        res.setHeader('Content-Length', targetFile.length);
-        res.setHeader('Accept-Ranges', 'bytes');
-        const stream = targetFile.createReadStream();
-        stream.on('error', failSafely);
-        return stream.pipe(res);
-    }
-
-    const parts = range.replace(/bytes=/, "").split("-");
-    const start = parseInt(parts[0], 10);
-    const end = parts[1] ? parseInt(parts[1], 10) : targetFile.length - 1;
-
-    if (isNaN(start) || isNaN(end) || start > end || end >= targetFile.length) {
-        return res.status(416).send('Invalid range');
-    }
-
-    const chunksize = (end - start) + 1;
-
-    res.writeHead(206, {
-        'Content-Range': `bytes ${start}-${end}/${targetFile.length}`,
-        'Accept-Ranges': 'bytes',
-        'Content-Length': chunksize,
-        'Content-Type': 'video/mp4'
-    });
-
-    const stream = targetFile.createReadStream({ start, end });
-
-    let streamTimeout = setTimeout(() => {
-        console.error(`[Timeout] تم قطع الاتصال المعلق لـ "${filePath}".`);
-        stream.destroy();
-        if (!res.headersSent) res.status(504).send('Torrent stream stalled (No Seeders)');
-    }, STREAM_STALL_TIMEOUT_MS);
-
-    stream.on('data', () => {
-        clearTimeout(streamTimeout);
-        streamTimeout = setTimeout(() => stream.destroy(), STREAM_STALL_TIMEOUT_MS);
-    });
-
-    stream.on('end', () => clearTimeout(streamTimeout));
-    stream.on('error', (err) => {
-        clearTimeout(streamTimeout);
-        failSafely(err);
-    });
-
-    stream.pipe(res);
-});
-
-app.delete('/api/v1/torrents/:hash', requireSecret, (req, res) => {
-    const infoHash = (req.params.hash || '').toLowerCase();
-
-    // إن كان نشطاً - دمّره (يحرر مكاناً ويشغّل تلقائياً التالي من الطابور عبر destroyEngine)
-    if (activeEngines[infoHash]) {
-        destroyEngine(infoHash);
-        return res.json({ status: 'cancelled', hash: infoHash });
-    }
-
-    // إن كان في الطابور فقط - احذفه من مكانه بدون التأثير على البقية
-    const queueIndex = pendingQueue.findIndex(item => item.infoHash === infoHash);
-    if (queueIndex !== -1) {
-        pendingQueue.splice(queueIndex, 1);
-        return res.json({ status: 'cancelled', hash: infoHash });
-    }
-
-    res.status(404).json({ error: 'Not found in active engines or queue' });
-});
-
-// معالج أخطاء صريح - يمنع Express من إرسال صفحة HTML بها stack trace كامل للعميل عند رفض CORS أو أي خطأ آخر
-app.use((err, req, res, next) => {
-    if (err && err.message === 'Blocked by Security: Unauthorized Origin') {
-        return res.status(403).json({ error: 'Unauthorized Origin' });
-    }
-    console.error('[Unhandled Error]', err && err.message);
-    if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
-});
-
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`Diagnostic API running on port ${PORT}`));
+// torrent-stream يستدعي options.storage كدالة مصنع: storage(chunkLength, opts)
+// تماماً كما تفعل memory-chunk-store و fs-chunk-store
+module.exports = function createSlidingWindowStore(chunkLength, opts) {
+    return new SlidingWindowStore(chunkLength, opts);
+};
+module.exports.SlidingWindowStore = SlidingWindowStore;
