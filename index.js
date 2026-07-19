@@ -35,7 +35,6 @@ function createByteLimitStore() {
                 chunkKeys.push(index);
                 currentCacheBytes += buf.length;
 
-                // التخلص الفوري والتتابعي من القطع القديمة للبقاء دائماً تحت سقف الـ 50 ميجابايت
                 while (currentCacheBytes > MAX_CACHE_BYTES && chunkKeys.length > 0) {
                     let oldestIndex = chunkKeys.shift();
                     if (chunks[oldestIndex]) {
@@ -66,12 +65,12 @@ function destroyEngine(infoHash) {
     console.log(`Cleared Engine from RAM for Hash: ${infoHash}`);
 }
 
-// 🟢 مسار فحص الحيوية (Health Check) مخصص لـ UptimeRobot بدون تشفير أو حماية ليعود بـ 200 OK دائماً
+// مسار فحص الحيوية (Health Check) مخصص لـ UptimeRobot
 app.get('/ping', (req, res) => {
     res.status(200).send('pong');
 });
 
-// 1. استقبال روابط الماغنيت
+// 1. استقبال روابط الماغنيت وحقن التراكرز المسموحة
 app.post('/api/v1/torrents', (req, res) => {
     const clientToken = req.headers['x-api-token'];
     if (!clientToken || clientToken !== API_SECRET_TOKEN) {
@@ -86,20 +85,39 @@ app.post('/api/v1/torrents', (req, res) => {
     let infoHash = hashMatch[1].toLowerCase();
 
     if (!activeEngines[infoHash]) {
+        // 🚀 [تحسين مضاف]: قائمة تراكرز مخصصة تعمل ببروتوكول HTTP/TCP المفتوح لتخطي حظر ريندر للـ UDP
+        const httpTrackers = [
+            "http://tracker.gbitt.info:80/announce",
+            "http://tracker.nyap2p.com:8080/announce",
+            "https://tracker.nanoha.org:443/announce",
+            "http://share.tracker.v2ph.com:80/announce",
+            "http://tracker.files.fm:6969/announce",
+            "http://open.acgnxtracker.com:80/announce"
+        ];
+        
+        let enhancedMagnet = magnet;
+        httpTrackers.forEach(tr => {
+            if (!enhancedMagnet.includes(encodeURIComponent(tr)) && !enhancedMagnet.includes(tr)) {
+                enhancedMagnet += `&tr=${encodeURIComponent(tr)}`;
+            }
+        });
+
         let engine;
         try {
-            engine = torrentStream(magnet, { storage: createByteLimitStore });
+            engine = torrentStream(enhancedMagnet, { storage: createByteLimitStore });
+            
+            // 🚀 [تعديل جوهري]: تسجيل المحرك في الذاكرة فوراً لكي يراه الفرونت-إند ويعرف أنه قيد التحضير
+            activeEngines[infoHash] = engine;
         } catch (err) {
             console.error(`فشل إنشاء محرك التورنت لـ ${infoHash}:`, err.message);
             return res.status(500).json({ error: "Failed to start torrent engine" });
         }
 
         engine.on('error', (err) => {
-            console.error(`[Warning] خطأ قراءة في محرك التورنت لـ ${infoHash}:`, err && err.message);
+            console.error(`[Warning] خطأ في محرك التورنت لـ ${infoHash}:`, err && err.message);
         });
 
         engine.on('ready', () => {
-            activeEngines[infoHash] = engine;
             console.log(`Byte-Limit Adaptive Torrent Ready: ${engine.torrent.name}`);
         });
 
@@ -166,7 +184,6 @@ app.get('/data/*', (req, res) => {
     const start = parseInt(parts[0], 10);
     const end = parts[1] ? parseInt(parts[1], 10) : targetFile.length - 1;
 
-    // 🛠️ تم إصلاح الكود هنا واستبدال المتغير التالف idn بالتحقق السليم لـ isNaN(end)
     if (isNaN(start) || isNaN(end) || start > end || end >= targetFile.length) {
         return res.status(416).send('Invalid range');
     }
