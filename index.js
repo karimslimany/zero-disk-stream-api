@@ -4,19 +4,10 @@ const torrentStream = require('torrent-stream');
 
 const app = express();
 
-// 1. [تحسين مضاف]: قفل الحماية وتقييد الـ CORS على موقعك فقط لمنع الاستغلال الخارجي
-const ALLOWED_ORIGIN = "https://karimslimany.workers.dev"; // ضع دومين موقعك هنا بدقة
+// 🔐 التوكن السري لحماية السيرفر من الاستغلال الخارجي
+const API_SECRET_TOKEN = process.env.API_SECRET_TOKEN || "Karim_Secure_Streaming_2026_X";
 
-app.use(cors({
-    origin: (origin, callback) => {
-        // السماح بالطلبات التي لا تحتوي على Origin (مثل تطبيقات الـ Android كـ 1DM+ أو أداة UptimeRobot)
-        if (!origin || origin === ALLOWED_ORIGIN) {
-            callback(null, true);
-        } else {
-            callback(new Error('Blocked by Security: Unauthorized Origin'));
-        }
-    }
-}));
+app.use(cors()); 
 app.use(express.json());
 
 let activeEngines = {};
@@ -29,24 +20,22 @@ process.on('unhandledRejection', (err) => {
     console.error('[unhandledRejection] السيرفر مستمر بالعمل:', err && err.message);
 });
 
-// 🧠 [التعديل الجوهري]: كاش ذكي يعتمد على ميزانية البايتات الفعلية (~300MB) لتفادي التلف الصامت
+// 🧠 كاش البايتات الميكروي الآمن: ميزانية محكمة لحماية الرام من الانفجار نهائياً
 function createByteLimitStore() {
     let chunks = {};
     let chunkKeys = [];
     let currentCacheBytes = 0;
-    const MAX_CACHE_BYTES = 300 * 1024 * 1024; // 🚀 ميزانية صارمة: 300 ميجابايت كحد أقصى
+    const MAX_CACHE_BYTES = 50 * 1024 * 1024; // 🚀 تم تخفيض الميزانية إلى 50 ميجابايت (آمنة تماماً ومثالية للمسار الواحد)
 
     return {
-        get: (index, cb) => {
-            cb(null, chunks[index]);
-        },
+        get: (index, cb) => { cb(null, chunks[index]); },
         put: (index, buf, cb) => {
             if (!chunks[index]) {
                 chunks[index] = buf;
                 chunkKeys.push(index);
                 currentCacheBytes += buf.length;
 
-                // التخلص الذكي من أقدم القطع بالتتابع فقط عندما نتجاوز حاجز الـ 300 ميجابايت
+                // التخلص الفوري والتتابعي من القطع القديمة للبقاء دائماً تحت سقف الـ 50 ميجابايت
                 while (currentCacheBytes > MAX_CACHE_BYTES && chunkKeys.length > 0) {
                     let oldestIndex = chunkKeys.shift();
                     if (chunks[oldestIndex]) {
@@ -62,12 +51,11 @@ function createByteLimitStore() {
     };
 }
 
-// 📈 [تحسين مضاف]: فحص وتمرير تقرير استهلاك الرام الحقيقي (RSS) إلى الـ Logs كل دقيقة للمراقبة الحية
+// 📈 مراقبة استهلاك الرام الحقيقي (RSS) في الـ Logs كل دقيقة
 setInterval(() => {
     const memoryUsage = process.memoryUsage();
     const rssMB = (memoryUsage.rss / (1024 * 1024)).toFixed(2);
-    const heapUsedMB = (memoryUsage.heapUsed / (1024 * 1024)).toFixed(2);
-    console.log(`[Memory Monitor] Total RAM (RSS): ${rssMB} MB | Active Heap: ${heapUsedMB} MB`);
+    console.log(`[Memory Monitor] Total RAM (RSS): ${rssMB} MB`);
 }, 60000);
 
 function destroyEngine(infoHash) {
@@ -80,6 +68,11 @@ function destroyEngine(infoHash) {
 
 // 1. استقبال روابط الماغنيت
 app.post('/api/v1/torrents', (req, res) => {
+    const clientToken = req.headers['x-api-token'];
+    if (!clientToken || clientToken !== API_SECRET_TOKEN) {
+        return res.status(401).json({ error: "Unauthorized" });
+    }
+
     const { magnet } = req.body || {};
     if (!magnet) return res.status(400).json({ error: "Missing magnet Link" });
 
@@ -113,6 +106,11 @@ app.post('/api/v1/torrents', (req, res) => {
 
 // 2. تزويد الفرونت-إند بشجرة الملفات
 app.get('/api/v1/torrents', (req, res) => {
+    const clientToken = req.headers['x-api-token'];
+    if (!clientToken || clientToken !== API_SECRET_TOKEN) {
+        return res.status(401).json({ error: "Unauthorized" });
+    }
+
     let result = {};
     Object.keys(activeEngines).forEach(hash => {
         const engine = activeEngines[hash];
@@ -125,7 +123,7 @@ app.get('/api/v1/torrents', (req, res) => {
     res.json(result);
 });
 
-// 3. مسار البث التدفقي الصافي لـ 1DM+ مع مهلة انتظار ذكية لقفل التدفق المعلق
+// 3. مسار البث التدفقي الصافي لـ 1DM+
 app.get('/data/*', (req, res) => {
     let filePath;
     try {
@@ -146,11 +144,7 @@ app.get('/data/*', (req, res) => {
 
     const failSafely = (err) => {
         console.error(`خطأ أثناء بث الملف "${filePath}":`, err && err.message);
-        if (!res.headersSent) {
-            res.status(502).send('Streaming failed, please try again');
-        } else {
-            res.destroy();
-        }
+        try { res.destroy(); } catch (e) {}
     };
 
     const range = req.headers.range;
@@ -167,7 +161,7 @@ app.get('/data/*', (req, res) => {
     const start = parseInt(parts[0], 10);
     const end = parts[1] ? parseInt(parts[1], 10) : targetFile.length - 1;
 
-    if (isNaN(start) || isNaN(end) || start > end || end >= targetFile.length) {
+    if (isNaN(start) || idn && (start > end || end >= targetFile.length)) {
         return res.status(416).send('Invalid range');
     }
 
@@ -182,19 +176,15 @@ app.get('/data/*', (req, res) => {
 
     const stream = targetFile.createReadStream({ start, end });
 
-    // ⏱️ [تحسين مضاف]: تدمير الستريم المفتوح فوراً إذا انقطع تدفق البيانات تماماً (No Seeders) لمدة 30 ثانية
     let streamTimeout = setTimeout(() => {
-        console.error(`[Timeout] تم قطع الاتصال المعلق لـ "${filePath}" بسبب توقف تدفق البيانات من شبكة التورنت.`);
-        stream.destroy();
-        if (!res.headersSent) res.status(504).send('Torrent stream stalled (No Seeders)');
+        console.error(`[Timeout Check] Stalled stream destroyed for: "${filePath}"`);
+        try { stream.destroy(); res.destroy(); } catch (e) {}
     }, 30000);
 
     stream.on('data', () => {
-        // إنعاش المؤقت الزمني مع كل حزمة بايتات جديدة تصل بنجاح
         clearTimeout(streamTimeout);
         streamTimeout = setTimeout(() => {
-            console.error(`[Timeout] انقطع التدفق فجأة أثناء التحميل لـ "${filePath}".`);
-            stream.destroy();
+            try { stream.destroy(); res.destroy(); } catch (e) {}
         }, 30000);
     });
 
@@ -208,4 +198,4 @@ app.get('/data/*', (req, res) => {
 });
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`Zero-Disk Byte-Limit API running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Zero-Disk Secure Byte-Limit API running on port ${PORT}`));
