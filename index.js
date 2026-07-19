@@ -105,6 +105,75 @@ const IDLE_ENGINE_TIMEOUT_MS = parseInt(process.env.IDLE_ENGINE_TIMEOUT_MS || (2
 // عند تجاوزه، نحذف كل التورنتات النشطة فوراً بدل الاكتفاء بحذف واحد فقط، لتفادي إعادة تشغيل قسري للسيرفر بالكامل.
 const HARD_MEMORY_MB = parseInt(process.env.HARD_MEMORY_MB || '350', 10);
 
+// *** الإصلاح الفعلي لمشكلة الذاكرة غير المحدودة ***
+// بدل تحميل الملف كاملاً ثم محاولة حذف القطع القديمة من الذاكرة (وهو ما فشل: القطع
+// البعيدة أمام رأس التشغيل كانت لا تزال تُحمَّل من الشبكة وتُحتفَظ بها بالكامل)، نتحكم
+// الآن في *أي نطاق بايت من الملف يُسمح لمحرك التورنت بتحميله أصلاً* عبر engine.select/
+// engine.deselect، ونُحرّك هذا النطاق تدريجياً مع تقدّم رأس التشغيل الفعلي (انظر
+// attachSelectionWindow أدناه). القطع خارج هذا النطاق لا تُطلب من الشبكة إطلاقاً.
+const DOWNLOAD_WINDOW_AHEAD_MB = parseFloat(process.env.CHUNK_WINDOW_AHEAD_MB || '40');
+const DOWNLOAD_WINDOW_BEHIND_MB = parseFloat(process.env.CHUNK_WINDOW_BEHIND_MB || '20');
+const DOWNLOAD_WINDOW_AHEAD_BYTES = DOWNLOAD_WINDOW_AHEAD_MB * 1024 * 1024;
+const DOWNLOAD_WINDOW_BEHIND_BYTES = DOWNLOAD_WINDOW_BEHIND_MB * 1024 * 1024;
+
+// ملاحظة أمانة تقنية: engine.select/deselect هنا تُستدعى بمحاذير try/catch لأن التوقيع
+// الدقيق (بايت مقابل رقم قطعة) غير موثَّق رسمياً بشكل يمكن التحقق منه هنا بدون شبكة -
+// إن فشل الاستدعاء لأي سبب، يُسجَّل تحذير بدل انهيار الخادم، ويستمر التحميل بلا تحديد نطاق
+// (سلوك أقدم لكن آمن) - راقب اللوغ بحثاً عن "[SelectWindow] فشل" للتأكد أنها تعمل فعلاً.
+function selectWindow(engine, from, to) {
+    try {
+        engine.select(from, to, true);
+    } catch (e) {
+        console.warn(`[SelectWindow] فشل استدعاء engine.select(${from}, ${to}):`, e && e.message);
+    }
+}
+function deselectWindow(engine, from, to) {
+    try {
+        engine.deselect(from, to, true);
+    } catch (e) {
+        console.warn(`[SelectWindow] فشل استدعاء engine.deselect(${from}, ${to}):`, e && e.message);
+    }
+}
+
+// ينشئ "نافذة تحميل" متحركة بالبايت لطلب بث واحد. moveTo(consumedAbsoluteByte) تُحرّك
+// النطاق المسموح تحميله ليتبع ما استهلكه العميل فعلياً؛ cleanup() تُلغي التحديد عند
+// انتهاء/قطع الاتصال حتى لا يبقى نطاق قديم محجوزاً للتحميل بلا داعٍ.
+// تنبيه: إن فتح العميل (1DM+) عدة اتصالات متوازية لنطاقات مختلفة من نفس الملف في آنٍ
+// واحد (شائع في مديري التحميل لتسريع النقل)، فكل اتصال يُدير نافذته الخاصة بشكل مستقل -
+// قد يتداخل هذا مع بعضه (اتصال يُلغي تحديد نطاق لا يزال اتصال آخر يحتاجه). راقب هذا
+// الاحتمال إن استمرت مشاكل الأداء رغم ثبات الذاكرة.
+function attachSelectionWindow(engine, fileOffset, rangeStart, rangeEnd) {
+    const absoluteRangeStart = fileOffset + rangeStart;
+    const absoluteRangeEnd = fileOffset + rangeEnd;
+    let currentWindow = null;
+
+    function moveTo(consumedAbsoluteByte) {
+        const newTo = Math.min(consumedAbsoluteByte + DOWNLOAD_WINDOW_AHEAD_BYTES, absoluteRangeEnd);
+        const newFrom = Math.max(absoluteRangeStart, consumedAbsoluteByte - DOWNLOAD_WINDOW_BEHIND_BYTES);
+
+        if (currentWindow) {
+            const aheadAdvance = newTo - currentWindow.to;
+            const behindAdvance = newFrom - currentWindow.from;
+            // حدّث فقط إن تقدّمت أي من الحافتين بمقدار معتبر (نصف ميزانيتها) - وإلا تجاهل
+            // (بدون هذا الشرط، كان يُستدعى select/deselect عند كل دفعة بيانات تقريباً)
+            if (aheadAdvance < (DOWNLOAD_WINDOW_AHEAD_BYTES / 2) && behindAdvance < (DOWNLOAD_WINDOW_BEHIND_BYTES / 2)) return;
+            deselectWindow(engine, currentWindow.from, currentWindow.to);
+        }
+        selectWindow(engine, newFrom, newTo);
+        currentWindow = { from: newFrom, to: newTo };
+    }
+
+    function cleanup() {
+        if (currentWindow) {
+            deselectWindow(engine, currentWindow.from, currentWindow.to);
+            currentWindow = null;
+        }
+    }
+
+    moveTo(absoluteRangeStart); // نافذة أولية عند بدء الطلب
+    return { moveTo, cleanup };
+}
+
 process.on('uncaughtException', (err) => {
     console.error('[uncaughtException] السيرفر مستمر بالعمل:', err.message);
 });
@@ -375,18 +444,14 @@ app.get('/data/*', (req, res) => {
         engineStatus[ownerHash].lastAccess = Date.now();
     }
 
-    // اختر هذا الملف فقط للتحميل الفعلي؛ هذا يمنع تحميل باقي ملفات التورنت (مثلاً حلقات أخرى) إلى الذاكرة
-    targetFile.select();
+    // لم نعد نستدعي targetFile.select() (كانت تطلب الملف كاملاً من الشبكة فوراً بلا حدود -
+    // وهذا كان السبب الجذري لتجاوز الذاكرة رغم وجود "نافذة" ظاهرية في التخزين).
+    // بدلها، كل طلب بث ينشئ نافذة تحميل متحركة خاصة به عبر attachSelectionWindow أدناه.
 
-    // مرجع التخزين المخصص (النافذة المتحركة) الخاص بهذا المحرك - نحدّث "رأس التشغيل" فيه
-    // بناءً على البايتات المُرسَلة فعلياً للعميل، حتى تُحذف القطع الأقدم من الذاكرة تباعاً
     // مرجع التخزين المخصص (النافذة المتحركة) الخاص بهذا المحرك - يُلتقط صراحةً وقت الإنشاء
-    // في startEngine بدل تخمين خاصية داخلية في كائن engine (كانت هذه نقطة الفشل الفعلية:
-    // engine.store/engine.storage لم تكن الخاصية الصحيحة، فالحذف لم يعمل إطلاقاً من قبل)
+    // في startEngine بدل تخمين خاصية داخلية في كائن engine
     const store = ownerHash && engineStores[ownerHash];
     if (!store) {
-        // لا نوقف البث بسبب هذا - لكن نُسجّله بوضوح لأن غيابه يعني أن نافذة الذاكرة
-        // المتحركة لن تعمل لهذا الطلب (تماماً كما حدث سابقاً بصمت) - يجب ألا يظهر هذا أبداً
         console.warn(`[SlidingWindowStore] تحذير: لم يُعثر على مخزن مرتبط بـ ${ownerHash} - لن يعمل حذف القطع القديمة لهذا التورنت`);
     }
     // موضع هذا الملف داخل التورنت الكامل - القطع مرقّمة على مستوى التورنت وليس الملف
@@ -407,15 +472,20 @@ app.get('/data/*', (req, res) => {
         res.setHeader('Content-Length', targetFile.length);
         res.setHeader('Accept-Ranges', 'bytes');
         res.setHeader('Content-Type', getContentType(filePath));
+        const window = attachSelectionWindow(ownerEngine, fileOffset, 0, targetFile.length - 1);
         const stream = targetFile.createReadStream();
         let sentBytes = 0;
         stream.on('data', (chunk) => {
             sentBytes += chunk.length;
+            const consumedAbsolute = fileOffset + sentBytes;
             if (store && typeof store.setPlayheadByte === 'function') {
-                store.setPlayheadByte(fileOffset + sentBytes);
+                store.setPlayheadByte(consumedAbsolute);
             }
+            window.moveTo(consumedAbsolute);
         });
-        stream.on('error', failSafely);
+        stream.on('end', () => window.cleanup());
+        stream.on('close', () => window.cleanup());
+        stream.on('error', (err) => { window.cleanup(); failSafely(err); });
         return stream.pipe(res);
     }
 
@@ -436,6 +506,7 @@ app.get('/data/*', (req, res) => {
         'Content-Type': getContentType(filePath)
     });
 
+    const window = attachSelectionWindow(ownerEngine, fileOffset, start, end);
     const stream = targetFile.createReadStream({ start, end });
     let sentRangeBytes = 0;
 
@@ -449,14 +520,18 @@ app.get('/data/*', (req, res) => {
         clearTimeout(streamTimeout);
         streamTimeout = setTimeout(() => stream.destroy(), STREAM_STALL_TIMEOUT_MS);
         sentRangeBytes += chunk.length;
+        const consumedAbsolute = fileOffset + start + sentRangeBytes;
         if (store && typeof store.setPlayheadByte === 'function') {
-            store.setPlayheadByte(fileOffset + start + sentRangeBytes);
+            store.setPlayheadByte(consumedAbsolute);
         }
+        window.moveTo(consumedAbsolute);
     });
 
-    stream.on('end', () => clearTimeout(streamTimeout));
+    stream.on('end', () => { clearTimeout(streamTimeout); window.cleanup(); });
+    stream.on('close', () => window.cleanup());
     stream.on('error', (err) => {
         clearTimeout(streamTimeout);
+        window.cleanup();
         failSafely(err);
     });
 
