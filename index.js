@@ -25,7 +25,7 @@ function createByteLimitStore() {
     let chunks = {};
     let chunkKeys = [];
     let currentCacheBytes = 0;
-    const MAX_CACHE_BYTES = 50 * 1024 * 1024; // 🚀 تم تخفيض الميزانية إلى 50 ميجابايت (آمنة تماماً ومثالية للمسار الواحد)
+    const MAX_CACHE_BYTES = 50 * 1024 * 1024; // ميزانية 50 ميجابايت (آمنة تماماً ومثالية للمسار الواحد)
 
     return {
         get: (index, cb) => { cb(null, chunks[index]); },
@@ -65,6 +65,11 @@ function destroyEngine(infoHash) {
     delete activeEngines[infoHash];
     console.log(`Cleared Engine from RAM for Hash: ${infoHash}`);
 }
+
+// 🟢 مسار فحص الحيوية (Health Check) مخصص لـ UptimeRobot بدون تشفير أو حماية ليعود بـ 200 OK دائماً
+app.get('/ping', (req, res) => {
+    res.status(200).send('pong');
+});
 
 // 1. استقبال روابط الماغنيت
 app.post('/api/v1/torrents', (req, res) => {
@@ -161,7 +166,8 @@ app.get('/data/*', (req, res) => {
     const start = parseInt(parts[0], 10);
     const end = parts[1] ? parseInt(parts[1], 10) : targetFile.length - 1;
 
-    if (isNaN(start) || idn && (start > end || end >= targetFile.length)) {
+    // 🛠️ تم إصلاح الكود هنا واستبدال المتغير التالف idn بالتحقق السليم لـ isNaN(end)
+    if (isNaN(start) || isNaN(end) || start > end || end >= targetFile.length) {
         return res.status(416).send('Invalid range');
     }
 
