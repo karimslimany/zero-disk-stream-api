@@ -53,6 +53,14 @@ const MAX_CONCURRENT_ENGINES = parseInt(process.env.MAX_CONCURRENT_ENGINES || '1
 // الحقيقي للتحميل الفعلي وليس مجرد استهلاك الإقلاع الأساسي.
 const MAX_MEMORY_MB = parseInt(process.env.MAX_MEMORY_MB || '200', 10);
 
+// مهلة اعتبار البث "متوقفاً" - رُفعت من 30 إلى 90 ثانية افتراضياً. السبب: عند نت غير مستقر لدى العميل،
+// Node.js يطبّق backpressure فيتوقف حدث 'data' عن الإطلاق بسبب بطء العميل نفسه وليس توقف التورنت -
+// مهلة قصيرة جداً كانت تقتل البث ظلماً في هذه الحالة بالضبط.
+const STREAM_STALL_TIMEOUT_MS = parseInt(process.env.STREAM_STALL_TIMEOUT_MS || '90000', 10);
+
+// بعد كم من عدم النشاط (لا طلبات بث) يُعتبر التورنت مهجوراً ويُحذف - وليس وقتاً ثابتاً منذ الإنشاء
+const IDLE_ENGINE_TIMEOUT_MS = parseInt(process.env.IDLE_ENGINE_TIMEOUT_MS || (2 * 60 * 60 * 1000), 10);
+
 // سقف طارئ "صارم" - إذا وصلنا هنا فالخطر حقيقي (Render يقتل العملية عند 512MB).
 // عند تجاوزه، نحذف كل التورنتات النشطة فوراً بدل الاكتفاء بحذف واحد فقط، لتفادي إعادة تشغيل قسري للسيرفر بالكامل.
 const HARD_MEMORY_MB = parseInt(process.env.HARD_MEMORY_MB || '350', 10);
@@ -83,6 +91,19 @@ function evictLeastRecentlyUsed(excludeHash) {
     return false;
 }
 
+function sweepIdleEngines() {
+    const now = Date.now();
+    Object.keys(activeEngines).forEach(hash => {
+        const status = engineStatus[hash];
+        // لا تحذف تورنتاً لا يزال في مرحلة "loading" (له مهلته الخاصة عبر metadataTimer)
+        if (!status || status.state !== 'ready') return;
+        const idleFor = now - (status.lastAccess || 0);
+        if (idleFor > IDLE_ENGINE_TIMEOUT_MS) {
+            console.log(`[Idle Cleanup] حذف ${hash} بعد ${Math.round(idleFor / 60000)} دقيقة من عدم النشاط`);
+            destroyEngine(hash);
+        }
+    });
+}
 function destroyAllEngines(reason) {
     const hashes = Object.keys(activeEngines);
     console.error(`[HARD LIMIT] ${reason} - تدمير جميع التورنتات النشطة (${hashes.length}) فوراً لتفادي قتل العملية من طرف Render`);
@@ -107,6 +128,7 @@ setInterval(() => {
     } else {
         processQueue(); // تأكيد دوري: استئناف الطابور تلقائياً بعد انتهاء أي فترة تهدئة
     }
+    sweepIdleEngines(); // احذف فقط ما كان خاملاً فعلاً منذ فترة طويلة - وليس وقتاً ثابتاً منذ الإنشاء
 }, 10000); // كل 10 ثواني بدل 60 - على بيئة بهذا الضيق (512MB)، الذاكرة قد ترتفع بسرعة أثناء البث
 
 function destroyEngine(infoHash) {
@@ -176,7 +198,8 @@ function startEngine(infoHash, magnet) {
         console.log(`[SUCCESS] Torrent Ready in RAM: ${engine.torrent.name} (${engine.files.length} ملفات، لا شيء محدد للتحميل بعد)`);
     });
 
-    setTimeout(() => destroyEngine(infoHash), 2 * 60 * 60 * 1000);
+    // ملاحظة: لا نضع هنا مؤقت حذف ثابت منذ الإنشاء - المسح الدوري لعدم النشاط (انظر IDLE_ENGINE_TIMEOUT_MS
+    // أدناه في المراقب الدوري) هو من يقرر الحذف بناءً على آخر استخدام فعلي، وليس وقتاً ثابتاً قد يقطع تحميلاً نشطاً
 }
 
 // يأخذ العنصر التالي من الطابور ويشغّله، بشرط وجود مكان شاغر - بهذا تُعالج طلبات 1DM+ المتعددة بالدور تلقائياً
@@ -336,11 +359,11 @@ app.get('/data/*', (req, res) => {
         console.error(`[Timeout] تم قطع الاتصال المعلق لـ "${filePath}".`);
         stream.destroy();
         if (!res.headersSent) res.status(504).send('Torrent stream stalled (No Seeders)');
-    }, 30000);
+    }, STREAM_STALL_TIMEOUT_MS);
 
     stream.on('data', () => {
         clearTimeout(streamTimeout);
-        streamTimeout = setTimeout(() => stream.destroy(), 30000);
+        streamTimeout = setTimeout(() => stream.destroy(), STREAM_STALL_TIMEOUT_MS);
     });
 
     stream.on('end', () => clearTimeout(streamTimeout));
