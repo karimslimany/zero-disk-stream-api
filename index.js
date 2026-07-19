@@ -4,15 +4,37 @@ const torrentStream = require('torrent-stream');
 
 const app = express();
 
-// 🔐 التوكن السري لحماية السيرفر من الاستغلال الخارجي
-const API_SECRET_TOKEN = process.env.API_SECRET_TOKEN || "Karim_Secure_Streaming_2026_X";
-
-app.use(cors()); 
+// قفل CORS على موقعك فقط (طبقة أولى، شكلية أكثر منها حماية فعلية لأن CORS
+// لا يحمي من طلبات خارج المتصفح، لكنها لا تضر بوجودها)
+const ALLOWED_ORIGIN = "https://karimslimany.workers.dev";
+app.use(cors({
+    origin: (origin, callback) => {
+        if (!origin || origin === ALLOWED_ORIGIN) {
+            callback(null, true);
+        } else {
+            callback(new Error('Blocked by Security: Unauthorized Origin'));
+        }
+    }
+}));
 app.use(express.json());
+
+// 🔐 [الحماية الحقيقية]: توكن سري يجب أن يصل مع كل طلب حساس (إضافة/استعراض
+// التورنتات). هذا التوكن لا يُكتب أبداً في كود موقعك المرئي — يُحقن فقط من
+// داخل الـ Worker الخاص بك على السيرفر مباشرة، تماماً كما يحدث حالياً مع
+// مفاتيح OMDb وOpenSubtitles. غيّر القيمة الافتراضية هنا لقيمة عشوائية خاصة بك،
+// والأفضل ضبطها كمتغير بيئة (Environment Variable) باسم APP_SECRET على Render
+const APP_SECRET = process.env.APP_SECRET || "868d3227e88247592bf1dfeac474312a0722abfbec4ad623";
+
+function requireSecret(req, res, next) {
+    const provided = req.headers['x-app-secret'];
+    if (provided !== APP_SECRET) {
+        return res.status(401).json({ error: "Unauthorized: Missing or invalid secret token" });
+    }
+    next();
+}
 
 let activeEngines = {};
 
-// شبكة أمان عامة للخطأ غير المتوقع
 process.on('uncaughtException', (err) => {
     console.error('[uncaughtException] السيرفر مستمر بالعمل:', err.message);
 });
@@ -20,15 +42,17 @@ process.on('unhandledRejection', (err) => {
     console.error('[unhandledRejection] السيرفر مستمر بالعمل:', err && err.message);
 });
 
-// 🧠 كاش البايتات الميكروي الآمن: ميزانية محكمة لحماية الرام من الانفجار نهائياً
+// 🧠 كاش ذكي يعتمد على ميزانية البايتات الفعلية (~300MB) لتفادي التلف الصامت
 function createByteLimitStore() {
     let chunks = {};
     let chunkKeys = [];
     let currentCacheBytes = 0;
-    const MAX_CACHE_BYTES = 50 * 1024 * 1024; // ميزانية 50 ميجابايت (آمنة تماماً ومثالية للمسار الواحد)
+    const MAX_CACHE_BYTES = 300 * 1024 * 1024;
 
     return {
-        get: (index, cb) => { cb(null, chunks[index]); },
+        get: (index, cb) => {
+            cb(null, chunks[index]);
+        },
         put: (index, buf, cb) => {
             if (!chunks[index]) {
                 chunks[index] = buf;
@@ -50,11 +74,12 @@ function createByteLimitStore() {
     };
 }
 
-// 📈 مراقبة استهلاك الرام الحقيقي (RSS) في الـ Logs كل دقيقة
+// 📈 تقرير استهلاك الرام الحقيقي (RSS) إلى الـ Logs كل دقيقة للمراقبة الحية
 setInterval(() => {
     const memoryUsage = process.memoryUsage();
     const rssMB = (memoryUsage.rss / (1024 * 1024)).toFixed(2);
-    console.log(`[Memory Monitor] Total RAM (RSS): ${rssMB} MB`);
+    const heapUsedMB = (memoryUsage.heapUsed / (1024 * 1024)).toFixed(2);
+    console.log(`[Memory Monitor] Total RAM (RSS): ${rssMB} MB | Active Heap: ${heapUsedMB} MB`);
 }, 60000);
 
 function destroyEngine(infoHash) {
@@ -65,18 +90,8 @@ function destroyEngine(infoHash) {
     console.log(`Cleared Engine from RAM for Hash: ${infoHash}`);
 }
 
-// مسار فحص الحيوية (Health Check) مخصص لـ UptimeRobot
-app.get('/ping', (req, res) => {
-    res.status(200).send('pong');
-});
-
-// 1. استقبال روابط الماغنيت وحقن التراكرز المسموحة
-app.post('/api/v1/torrents', (req, res) => {
-    const clientToken = req.headers['x-api-token'];
-    if (!clientToken || clientToken !== API_SECRET_TOKEN) {
-        return res.status(401).json({ error: "Unauthorized" });
-    }
-
+// 1. استقبال روابط الماغنيت — محمي بالتوكن السري
+app.post('/api/v1/torrents', requireSecret, (req, res) => {
     const { magnet } = req.body || {};
     if (!magnet) return res.status(400).json({ error: "Missing magnet Link" });
 
@@ -85,39 +100,20 @@ app.post('/api/v1/torrents', (req, res) => {
     let infoHash = hashMatch[1].toLowerCase();
 
     if (!activeEngines[infoHash]) {
-        // 🚀 [تحسين مضاف]: قائمة تراكرز مخصصة تعمل ببروتوكول HTTP/TCP المفتوح لتخطي حظر ريندر للـ UDP
-        const httpTrackers = [
-            "http://tracker.gbitt.info:80/announce",
-            "http://tracker.nyap2p.com:8080/announce",
-            "https://tracker.nanoha.org:443/announce",
-            "http://share.tracker.v2ph.com:80/announce",
-            "http://tracker.files.fm:6969/announce",
-            "http://open.acgnxtracker.com:80/announce"
-        ];
-        
-        let enhancedMagnet = magnet;
-        httpTrackers.forEach(tr => {
-            if (!enhancedMagnet.includes(encodeURIComponent(tr)) && !enhancedMagnet.includes(tr)) {
-                enhancedMagnet += `&tr=${encodeURIComponent(tr)}`;
-            }
-        });
-
         let engine;
         try {
-            engine = torrentStream(enhancedMagnet, { storage: createByteLimitStore });
-            
-            // 🚀 [تعديل جوهري]: تسجيل المحرك في الذاكرة فوراً لكي يراه الفرونت-إند ويعرف أنه قيد التحضير
-            activeEngines[infoHash] = engine;
+            engine = torrentStream(magnet, { storage: createByteLimitStore });
         } catch (err) {
             console.error(`فشل إنشاء محرك التورنت لـ ${infoHash}:`, err.message);
             return res.status(500).json({ error: "Failed to start torrent engine" });
         }
 
         engine.on('error', (err) => {
-            console.error(`[Warning] خطأ في محرك التورنت لـ ${infoHash}:`, err && err.message);
+            console.error(`[Warning] خطأ قراءة في محرك التورنت لـ ${infoHash}:`, err && err.message);
         });
 
         engine.on('ready', () => {
+            activeEngines[infoHash] = engine;
             console.log(`Byte-Limit Adaptive Torrent Ready: ${engine.torrent.name}`);
         });
 
@@ -127,13 +123,8 @@ app.post('/api/v1/torrents', (req, res) => {
     res.json({ status: "added", hash: infoHash });
 });
 
-// 2. تزويد الفرونت-إند بشجرة الملفات
-app.get('/api/v1/torrents', (req, res) => {
-    const clientToken = req.headers['x-api-token'];
-    if (!clientToken || clientToken !== API_SECRET_TOKEN) {
-        return res.status(401).json({ error: "Unauthorized" });
-    }
-
+// 2. تزويد الفرونت-إند بشجرة الملفات — محمي بالتوكن السري أيضاً
+app.get('/api/v1/torrents', requireSecret, (req, res) => {
     let result = {};
     Object.keys(activeEngines).forEach(hash => {
         const engine = activeEngines[hash];
@@ -146,7 +137,10 @@ app.get('/api/v1/torrents', (req, res) => {
     res.json(result);
 });
 
-// 3. مسار البث التدفقي الصافي لـ 1DM+
+// 3. مسار البث التدفقي الصافي لـ 1DM+ — بدون توكن عمداً، لأن 1DM+ يفتح هذا
+// الرابط مباشرة بدون أي ترويسات مخصصة، فلا يمكن إرفاق التوكن معه إطلاقاً.
+// الحماية الوحيدة الممكنة هنا هي أن الرابط لا يُعرف أصلاً إلا بعد إضافة
+// التورنت بنجاح عبر المسار المحمي أعلاه
 app.get('/data/*', (req, res) => {
     let filePath;
     try {
@@ -167,7 +161,11 @@ app.get('/data/*', (req, res) => {
 
     const failSafely = (err) => {
         console.error(`خطأ أثناء بث الملف "${filePath}":`, err && err.message);
-        try { res.destroy(); } catch (e) {}
+        if (!res.headersSent) {
+            res.status(502).send('Streaming failed, please try again');
+        } else {
+            res.destroy();
+        }
     };
 
     const range = req.headers.range;
@@ -200,14 +198,16 @@ app.get('/data/*', (req, res) => {
     const stream = targetFile.createReadStream({ start, end });
 
     let streamTimeout = setTimeout(() => {
-        console.error(`[Timeout Check] Stalled stream destroyed for: "${filePath}"`);
-        try { stream.destroy(); res.destroy(); } catch (e) {}
+        console.error(`[Timeout] تم قطع الاتصال المعلق لـ "${filePath}" بسبب توقف تدفق البيانات من شبكة التورنت.`);
+        stream.destroy();
+        if (!res.headersSent) res.status(504).send('Torrent stream stalled (No Seeders)');
     }, 30000);
 
     stream.on('data', () => {
         clearTimeout(streamTimeout);
         streamTimeout = setTimeout(() => {
-            try { stream.destroy(); res.destroy(); } catch (e) {}
+            console.error(`[Timeout] انقطع التدفق فجأة أثناء التحميل لـ "${filePath}".`);
+            stream.destroy();
         }, 30000);
     });
 
@@ -221,4 +221,4 @@ app.get('/data/*', (req, res) => {
 });
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`Zero-Disk Secure Byte-Limit API running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Zero-Disk Byte-Limit API running on port ${PORT}`));
