@@ -4,8 +4,7 @@ const torrentStream = require('torrent-stream');
 
 const app = express();
 
-// قفل CORS على موقعك فقط (طبقة أولى، شكلية أكثر منها حماية فعلية لأن CORS
-// لا يحمي من طلبات خارج المتصفح، لكنها لا تضر بوجودها)
+// قفل CORS على موقعك فقط (طبقة أولى، شكلية أكثر منها حماية فعلية)
 const ALLOWED_ORIGIN = "https://karimslimany.workers.dev";
 app.use(cors({
     origin: (origin, callback) => {
@@ -18,15 +17,14 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// 🔐 [الحماية الحقيقية]: توكن سري يجب أن يصل مع كل طلب حساس (إضافة/استعراض
-// التورنتات). هذا التوكن لا يُكتب أبداً في كود موقعك المرئي — يُحقن فقط من
-// داخل الـ Worker الخاص بك على السيرفر مباشرة، تماماً كما يحدث حالياً مع
-// مفاتيح OMDb وOpenSubtitles. غيّر القيمة الافتراضية هنا لقيمة عشوائية خاصة بك،
-// والأفضل ضبطها كمتغير بيئة (Environment Variable) باسم APP_SECRET على Render
-const APP_SECRET = process.env.APP_SECRET || "868d3227e88247592bf1dfeac474312a0722abfbec4ad623";
+// 🔐 الحماية الحقيقية: توكن سري يجب أن يصل مع كل طلب حساس. يُحقن هذا التوكن
+// تلقائياً من داخل الـ Worker (ولا يظهر أبداً في كود الموقع المرئي). القيمة
+// هنا مطابقة تماماً لما ضبطته في الـ Worker — الأفضل ضبطها كمتغير بيئة
+// باسم APP_SECRET على Render بدل تركها مكتوبة بالكود مباشرة
+const APP_SECRET = process.env.APP_SECRET || "Karim_Secure_Streaming_2026_X";
 
 function requireSecret(req, res, next) {
-    const provided = req.headers['x-app-secret'];
+    const provided = req.headers['x-api-token'];
     if (provided !== APP_SECRET) {
         return res.status(401).json({ error: "Unauthorized: Missing or invalid secret token" });
     }
@@ -35,6 +33,7 @@ function requireSecret(req, res, next) {
 
 let activeEngines = {};
 
+// 🛡️ شبكة أمان عامة للخطأ غير المتوقع — تمنع انهيار السيرفر بالكامل
 process.on('uncaughtException', (err) => {
     console.error('[uncaughtException] السيرفر مستمر بالعمل:', err.message);
 });
@@ -42,12 +41,14 @@ process.on('unhandledRejection', (err) => {
     console.error('[unhandledRejection] السيرفر مستمر بالعمل:', err && err.message);
 });
 
-// 🧠 كاش ذكي يعتمد على ميزانية البايتات الفعلية (~300MB) لتفادي التلف الصامت
+// 🧠 كاش ميكروي يعتمد على ميزانية بايتات صارمة (50MB) لضمان ثبات الرام
+// الإجمالي للسيرفر ضمن حدود Render المجاني (512MB) بهامش أمان كبير
+const MAX_CACHE_BYTES = 50 * 1024 * 1024;
+
 function createByteLimitStore() {
     let chunks = {};
     let chunkKeys = [];
     let currentCacheBytes = 0;
-    const MAX_CACHE_BYTES = 300 * 1024 * 1024;
 
     return {
         get: (index, cb) => {
@@ -59,7 +60,7 @@ function createByteLimitStore() {
                 chunkKeys.push(index);
                 currentCacheBytes += buf.length;
 
-                while (currentCacheBytes > MAX_CACHE_BYTES && chunkKeys.length > 0) {
+                while (currentCacheBytes > MAX_CACHE_BYTES && chunkKeys.length > 1) {
                     let oldestIndex = chunkKeys.shift();
                     if (chunks[oldestIndex]) {
                         currentCacheBytes -= chunks[oldestIndex].length;
@@ -114,7 +115,7 @@ app.post('/api/v1/torrents', requireSecret, (req, res) => {
 
         engine.on('ready', () => {
             activeEngines[infoHash] = engine;
-            console.log(`Byte-Limit Adaptive Torrent Ready: ${engine.torrent.name}`);
+            console.log(`Torrent Ready in RAM: ${engine.torrent.name}`);
         });
 
         setTimeout(() => destroyEngine(infoHash), 2 * 60 * 60 * 1000);
@@ -123,7 +124,7 @@ app.post('/api/v1/torrents', requireSecret, (req, res) => {
     res.json({ status: "added", hash: infoHash });
 });
 
-// 2. تزويد الفرونت-إند بشجرة الملفات — محمي بالتوكن السري أيضاً
+// 2. تزويد واجهة موقعك بشجرة الملفات — محمي بالتوكن السري أيضاً
 app.get('/api/v1/torrents', requireSecret, (req, res) => {
     let result = {};
     Object.keys(activeEngines).forEach(hash => {
@@ -137,10 +138,8 @@ app.get('/api/v1/torrents', requireSecret, (req, res) => {
     res.json(result);
 });
 
-// 3. مسار البث التدفقي الصافي لـ 1DM+ — بدون توكن عمداً، لأن 1DM+ يفتح هذا
-// الرابط مباشرة بدون أي ترويسات مخصصة، فلا يمكن إرفاق التوكن معه إطلاقاً.
-// الحماية الوحيدة الممكنة هنا هي أن الرابط لا يُعرف أصلاً إلا بعد إضافة
-// التورنت بنجاح عبر المسار المحمي أعلاه
+// 3. البث التدفقي الصافي — بدون توكن عمداً، لأن 1DM+ يفتح هذا الرابط مباشرة
+// بدون أي ترويسات مخصصة، فلا يمكن إرفاق التوكن معه إطلاقاً
 app.get('/data/*', (req, res) => {
     let filePath;
     try {
@@ -221,4 +220,4 @@ app.get('/data/*', (req, res) => {
 });
 
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`Zero-Disk Byte-Limit API running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Zero-Disk Byte-Limit Secured API running on port ${PORT}`));
