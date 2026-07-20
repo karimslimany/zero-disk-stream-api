@@ -98,6 +98,12 @@ const MAX_MEMORY_MB = parseInt(process.env.MAX_MEMORY_MB || '260', 10);
 // مهلة قصيرة جداً كانت تقتل البث ظلماً في هذه الحالة بالضبط.
 const STREAM_STALL_TIMEOUT_MS = parseInt(process.env.STREAM_STALL_TIMEOUT_MS || '90000', 10);
 
+// مهلة إغلاق الـ socket قسراً إن ظلّ خاملاً تماماً (لا بيانات بأي اتجاه إطلاقاً) - أطول من
+// STREAM_STALL_TIMEOUT_MS عمداً (تلك تراقب فقط جانب القراءة من التورنت، وهذه تراقب الاتصال
+// الفعلي مع العميل ذاته). ضرورية لأن الاتصالات المقطوعة بصمت (شبكات موبايل) لا تُطلق أي حدث
+// طبيعي في Node.js يسمح لنا بتحرير الذاكرة المرتبطة بها - انظر التعليق عند استخدامها في /data/*
+const SOCKET_IDLE_TIMEOUT_MS = parseInt(process.env.SOCKET_IDLE_TIMEOUT_MS || '120000', 10);
+
 // بعد كم من عدم النشاط (لا طلبات بث) يُعتبر التورنت مهجوراً ويُحذف - وليس وقتاً ثابتاً منذ الإنشاء
 const IDLE_ENGINE_TIMEOUT_MS = parseInt(process.env.IDLE_ENGINE_TIMEOUT_MS || (2 * 60 * 60 * 1000), 10);
 
@@ -420,6 +426,16 @@ app.get('/api/v1/torrents', requireSecret, (req, res) => {
 });
 
 app.get('/data/*', (req, res) => {
+    // *** إصلاح مهم: اتصالات تُقطع بصمت (شبكات موبايل، تعليق التطبيق) لا تُطلق حدث
+    // 'close' على الـ stream أبداً في Node.js - ما يبقي كل المراجع (store، chunks، إلخ)
+    // حبيسة closure ذلك الطلب للأبد حتى لو دمّرنا المحرك بالكامل لاحقاً. نفرض هنا مهلة
+    // صريحة على مستوى الـ socket نفسه تُغلقه قسراً إن ظلّ خاملاً تماماً (لا بيانات بأي اتجاه)
+    // لضمان إطلاق 'close' دائماً وتحرير الذاكرة الفعلي.
+    req.socket.setTimeout(SOCKET_IDLE_TIMEOUT_MS, () => {
+        console.warn(`[Socket Idle] إغلاق قسري لاتصال خامل تماماً على "${req.originalUrl}"`);
+        req.socket.destroy();
+    });
+
     let filePath;
     try {
         filePath = decodeURIComponent(req.params[0]);
