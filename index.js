@@ -484,6 +484,8 @@ app.get('/data/*', (req, res) => {
             window.moveTo(consumedAbsolute);
         });
         stream.on('end', () => window.cleanup());
+        // هذا المسار (بلا range) لا يملك مهلة توقف ذاتية، فـ 'close' هنا تعني دائماً
+        // انقطاعاً حقيقياً من العميل - آمن إلغاء التحديد عندها
         stream.on('close', () => window.cleanup());
         stream.on('error', (err) => { window.cleanup(); failSafely(err); });
         return stream.pipe(res);
@@ -509,16 +511,22 @@ app.get('/data/*', (req, res) => {
     const window = attachSelectionWindow(ownerEngine, fileOffset, start, end);
     const stream = targetFile.createReadStream({ start, end });
     let sentRangeBytes = 0;
+    let destroyedByOurTimeout = false; // true فقط عندما نحن من قطعنا الاتصال بسبب التوقف المؤقت
 
     let streamTimeout = setTimeout(() => {
         console.error(`[Timeout] تم قطع الاتصال المعلق لـ "${filePath}".`);
+        destroyedByOurTimeout = true;
         stream.destroy();
         if (!res.headersSent) res.status(504).send('Torrent stream stalled (No Seeders)');
     }, STREAM_STALL_TIMEOUT_MS);
 
     stream.on('data', (chunk) => {
         clearTimeout(streamTimeout);
-        streamTimeout = setTimeout(() => stream.destroy(), STREAM_STALL_TIMEOUT_MS);
+        streamTimeout = setTimeout(() => {
+            console.error(`[Timeout] تم قطع الاتصال المعلق لـ "${filePath}".`);
+            destroyedByOurTimeout = true;
+            stream.destroy();
+        }, STREAM_STALL_TIMEOUT_MS);
         sentRangeBytes += chunk.length;
         const consumedAbsolute = fileOffset + start + sentRangeBytes;
         if (store && typeof store.setPlayheadByte === 'function') {
@@ -528,7 +536,12 @@ app.get('/data/*', (req, res) => {
     });
 
     stream.on('end', () => { clearTimeout(streamTimeout); window.cleanup(); });
-    stream.on('close', () => window.cleanup());
+    // نُلغي التحديد عند 'close' فقط إن كان السبب انقطاعاً حقيقياً من العميل (مثلاً ألغى
+    // 1DM+ التحميل فعلياً) - وليس توقفنا المؤقت الذاتي، الذي غالباً يتبعه إعادة محاولة
+    // فورية من العميل على نفس النطاق تقريباً؛ إلغاء التحديد حينها كان يصفّر تقدّمها.
+    stream.on('close', () => {
+        if (!destroyedByOurTimeout) window.cleanup();
+    });
     stream.on('error', (err) => {
         clearTimeout(streamTimeout);
         window.cleanup();
