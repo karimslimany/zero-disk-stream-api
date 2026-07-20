@@ -76,13 +76,18 @@ let engineStores = {};
 let engineStatus = {}; // hash -> { state: 'loading'|'ready'|'failed', error?: string, lastAccess?: number }
 let pendingQueue = []; // [{ infoHash, magnet, queuedAt }] - طلبات تنتظر دورها لأن MAX_CONCURRENT_ENGINES ممتلئ
 let hardFlushCooldownUntil = 0; // بعد تنظيف طارئ، نمنع الطابور من إعادة الملء الفوري ليهدأ الاستخدام الفعلي للذاكرة (GC)
+// مؤقت انتظار الـ metadata لكل hash - نُخزّنه هنا صراحةً حتى نستطيع إلغاءه عند الحذف اليدوي
+// (بدون هذا، إلغاء تورنت ثم إعادة إضافة نفس الـ magnet فوراً قد يجعل المؤقت القديم يحذف
+// المحرك الجديد بالخطأ لاحقاً، لأنه يتحقق فقط من infoHash + الحالة وليس هوية النسخة بالضبط)
+let metadataTimers = {};
 
 const METADATA_TIMEOUT_MS = 30000; // إذا لم تصل بيانات التورنت خلال 30 ثانية، اعتبره فاشلاً بدل تعليقه للأبد
 
 // عدد التورنتات النشطة المسموح بها في نفس الوقت - كل واحد يخزن بياناته في الـ RAM
-// (التخزين المستخدم هو memory-chunk-store، فكل ميجا تُحمَّل تبقى في الذاكرة حتى تدمير المحرك)
-// على Render Free Tier (512MB RAM إجمالي)، وميزانية الكاش المحددة بـ 50MB فقط، تورنت واحد نشط
-// في نفس الوقت هو الخيار الآمن الوحيد - تورنتان متزامنان قد يتجاوزان الميزانية بسهولة.
+// (التخزين الآن SlidingWindowStore + نافذة تحميل متحركة عبر engine.select/deselect -
+// ~60MB كحد أقصى لكل تورنت نشط بدل الملف كاملاً كما كان الحال مع memory-chunk-store سابقاً)
+// على Render Free Tier (512MB RAM إجمالي)، تورنت واحد نشط في نفس الوقت هو الخيار الآمن الافتراضي -
+// تورنتان متزامنان ممكنان الآن نظرياً (المجموع ~120MB) لكن لم يُختبَر بعد بنفس القدر من الثقة.
 const MAX_CONCURRENT_ENGINES = parseInt(process.env.MAX_CONCURRENT_ENGINES || '1', 10);
 
 // سقف الذاكرة "اللين" (RSS بالميجابايت) - مفيد الآن بشكل أساسي في حالة وجود أكثر من تورنت
@@ -226,6 +231,7 @@ function destroyAllEngines(reason) {
     hashes.forEach(hash => destroyEngine(hash));
 }
 
+let lastSingleEngineWarnAt = 0;
 setInterval(() => {
     const memoryUsage = process.memoryUsage();
     const rssMB = memoryUsage.rss / (1024 * 1024);
@@ -245,7 +251,9 @@ setInterval(() => {
         if (activeCount > 1) {
             console.warn(`[Memory Monitor] تجاوزنا الحد الآمن (${MAX_MEMORY_MB} MB) - محاولة تحرير ذاكرة من تورنتات أخرى أقل استخداماً`);
             evictLeastRecentlyUsed();
-        } else if (activeCount === 1) {
+        } else if (activeCount === 1 && Date.now() - lastSingleEngineWarnAt > 120000) {
+            // مُخفَّض إلى مرة كل دقيقتين بدل كل 10 ثوانٍ - كان يُغرق اللوغ برسالة متطابقة بلا فائدة إضافية
+            lastSingleEngineWarnAt = Date.now();
             console.warn(`[Memory Monitor] تجاوزنا الحد الآمن (${MAX_MEMORY_MB} MB) لكن تورنت واحد فقط نشط - لن نحذفه؛ الحد الطارئ (${HARD_MEMORY_MB}MB) وحده من سيتدخل عند الخطر الحقيقي`);
         }
         // إن لم يبقَ تورنت نشط، فالذاكرة المرتفعة هي فقط heap محجوز من Node/V8 لم يُعَد بعد لنظام التشغيل -
@@ -263,6 +271,10 @@ function destroyEngine(infoHash) {
     delete activeEngines[infoHash];
     delete engineStatus[infoHash];
     delete engineStores[infoHash];
+    if (metadataTimers[infoHash]) {
+        clearTimeout(metadataTimers[infoHash]);
+        delete metadataTimers[infoHash];
+    }
     console.log(`Cleared Engine from RAM for Hash: ${infoHash}`);
     processQueue(); // حرّرنا مكاناً - شغّل التالي في الطابور إن وُجد
 }
@@ -274,6 +286,10 @@ function failEngine(infoHash, reason) {
     }
     delete activeEngines[infoHash];
     delete engineStores[infoHash];
+    if (metadataTimers[infoHash]) {
+        clearTimeout(metadataTimers[infoHash]);
+        delete metadataTimers[infoHash];
+    }
     engineStatus[infoHash] = { state: 'failed', error: reason };
     console.error(`[FAILED] لم يتم العثور على بيانات/سيدرز لـ ${infoHash}: ${reason}`);
     processQueue(); // حرّرنا مكاناً هنا أيضاً
@@ -315,14 +331,15 @@ function startEngine(infoHash, magnet) {
     });
 
     // إذا لم تصل بيانات التورنت (metadata) خلال المهلة، لا تتركه معلقاً - أفشله بوضوح
-    const metadataTimer = setTimeout(() => {
+    metadataTimers[infoHash] = setTimeout(() => {
         if (engineStatus[infoHash] && engineStatus[infoHash].state === 'loading') {
             failEngine(infoHash, 'No seeders / trackers unreachable within timeout');
         }
     }, METADATA_TIMEOUT_MS);
 
     engine.on('ready', () => {
-        clearTimeout(metadataTimer);
+        clearTimeout(metadataTimers[infoHash]);
+        delete metadataTimers[infoHash];
         activeEngines[infoHash] = engine;
         engineStatus[infoHash] = { state: 'ready', lastAccess: Date.now() };
 
