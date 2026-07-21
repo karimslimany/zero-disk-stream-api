@@ -308,13 +308,30 @@ function startEngine(infoHash, magnet) {
         };
         // التخزين المخصص: نافذة متحركة من القطع حول موضع التشغيل الحالي بدل الاحتفاظ
         // بالملف كاملاً في الذاكرة (انظر sliding-window-store.js لتفاصيل الآلية)
-        // *** أُزيل خيار "connections" الذي أُضيف سابقاً للحد من اتصالات الأقران ***
-        // لم أستطع التحقق من صحة اسمه من مصدر الحزمة، وتزامن إدخاله مع فشل "No seeders"
-        // على تورنتات مؤكدة النشاط (مئات السيدرز) - يُحتمل أنه كان يتداخل مع طريقة
-        // torrent-stream الداخلية في إعداد التراكرز/DHT، فيمنع العثور على أي قرين إطلاقاً.
-        // أُعيد للحالة الافتراضية (بلا تحديد) للتأكد أن هذا كان السبب فعلاً.
+        //
+        // *** السبب الفعلي لفشل "No seeders" على كل التورنتات (حتى ذات مئات السيدرز) ***
+        // خيار "connections" الذي أُضيف ثم أُزيل سابقاً لم يكن السبب (الفشل استمر بعد إزالته).
+        // السبب الحقيقي: Render لا يدعم UDP على خدمات الويب (لا استقبال UDP وارد بأي بورت
+        // عشوائي، والصادر منه غير موثوق خلف البروكسي/NAT). وآليتا اكتشاف الأقران الافتراضيتان
+        // في torrent-stream هما بالكامل UDP:
+        //   - DHT (dht: true افتراضياً) يحتاج بورت UDP يستقبل عليه ردود العقد الأخرى.
+        //   - أغلب الـ trackers في روابط magnet الحديثة هي udp:// (طلب/رد UDP).
+        // كلا الآليتين تفشل بصمت هنا بلا أي علاقة بعدد السيدرز الحقيقي، فتنتهي مهلة الـ
+        // METADATA_TIMEOUT_MS دائماً. الإصلاح: نعطّل DHT (لن يعمل هنا على أي حال، وتعطيله
+        // يوفر وقت المهلة)، ونعتمد فقط على trackers من نوع HTTP/HTTPS/WSS (تعمل عبر TCP)،
+        // مع إضافة قائمة عامة معروفة كنسخة احتياطية في حال كانت تراكرز الماغنت الأصلية
+        // udp:// فقط.
         engine = torrentStream(magnet, {
-            storage: capturingStorageFactory
+            storage: capturingStorageFactory,
+            dht: false,
+            tracker: true,
+            trackers: [
+                'https://tracker.opentrackr.org:443/announce',
+                'https://torrent.gresille.org:443/announce',
+                'https://tracker.tamersunion.org:443/announce',
+                'wss://tracker.openwebtorrent.com',
+                'wss://tracker.btorrent.xyz'
+            ]
         });
     } catch (err) {
         console.error(`فشل إنشاء محرك التورنت لـ ${infoHash}:`, err.message);
@@ -330,6 +347,11 @@ function startEngine(infoHash, magnet) {
         console.error(`[Engine Error] خطأ في محرك التورنت لـ ${infoHash}:`, err && err.message);
         failEngine(infoHash, err && err.message);
     });
+
+    // تحذيرات غير قاتلة (فشل تراكر فردي، خطأ DHT إلخ) - torrent-discovery يُصدرها كـ 'warning'
+    // ولا تصل عادة كـ engine 'error'. نسجّلها هنا خصيصاً للتأكد مباشرة من نظرية حجب UDP:
+    // لو ظهرت هنا رسائل timeout/ECONNREFUSED متكررة من تراكرز udp:// فهذا تأكيد قاطع.
+    engine.on('warning', (w) => console.warn(`[Tracker/DHT Warning] ${infoHash}:`, w && w.message ? w.message : w));
 
     // تسجيل أي نشاط شبكة نراه فعلياً، لمعرفة هل هناك اتصال بالـ swarm أصلاً
     engine.on('torrent', () => console.log(`[DEBUG] تم استقبال بيانات التورنت الأساسية لـ ${infoHash}`));
