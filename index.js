@@ -308,7 +308,16 @@ function startEngine(infoHash, magnet) {
         };
         // التخزين المخصص: نافذة متحركة من القطع حول موضع التشغيل الحالي بدل الاحتفاظ
         // بالملف كاملاً في الذاكرة (انظر sliding-window-store.js لتفاصيل الآلية)
-        engine = torrentStream(magnet, { storage: capturingStorageFactory });
+        // نحدّ من عدد اتصالات الأقران المتزامنة - بدون هذا، قد يفتح bittorrent-swarm عشرات
+        // الاتصالات في آنٍ واحد أثناء البحث عن قرين يملك البيانات، وكل اتصال يستهلك ذاكرة
+        // خاصة به (buffers بروتوكول wire) بغض النظر تماماً عن نافذة البث - هذا ما يفسّر
+        // ارتفاع الذاكرة حتى قبل بدء أي طلب /data/* فعلي.
+        // تنبيه: لم أتحقق من اسم هذا الخيار من مصدر الحزمة مباشرة (لا شبكة متاحة هنا) -
+        // راقب اللوغ؛ إن لم ينخفض عدد رسائل "[DEBUG] اتصال جديد بنظير" الظاهرة، فالخيار غير فعّال.
+        engine = torrentStream(magnet, {
+            storage: capturingStorageFactory,
+            connections: parseInt(process.env.MAX_PEER_CONNECTIONS || '20', 10)
+        });
     } catch (err) {
         console.error(`فشل إنشاء محرك التورنت لـ ${infoHash}:`, err.message);
         engineStatus[infoHash] = { state: 'failed', error: err.message };
