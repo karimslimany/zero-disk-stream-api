@@ -130,27 +130,92 @@ const HARD_MEMORY_MB = parseInt(process.env.HARD_MEMORY_MB || '350', 10);
 // الآن في *أي نطاق بايت من الملف يُسمح لمحرك التورنت بتحميله أصلاً* عبر engine.select/
 // engine.deselect، ونُحرّك هذا النطاق تدريجياً مع تقدّم رأس التشغيل الفعلي (انظر
 // attachSelectionWindow أدناه). القطع خارج هذا النطاق لا تُطلب من الشبكة إطلاقاً.
-const DOWNLOAD_WINDOW_AHEAD_MB = parseFloat(process.env.CHUNK_WINDOW_AHEAD_MB || '40');
-const DOWNLOAD_WINDOW_BEHIND_MB = parseFloat(process.env.CHUNK_WINDOW_BEHIND_MB || '20');
+const DOWNLOAD_WINDOW_AHEAD_MB = parseFloat(process.env.CHUNK_WINDOW_AHEAD_MB || '64');
+const DOWNLOAD_WINDOW_BEHIND_MB = parseFloat(process.env.CHUNK_WINDOW_BEHIND_MB || '32');
 const DOWNLOAD_WINDOW_AHEAD_BYTES = DOWNLOAD_WINDOW_AHEAD_MB * 1024 * 1024;
 const DOWNLOAD_WINDOW_BEHIND_BYTES = DOWNLOAD_WINDOW_BEHIND_MB * 1024 * 1024;
 
-// ملاحظة أمانة تقنية: engine.select/deselect هنا تُستدعى بمحاذير try/catch لأن التوقيع
-// الدقيق (بايت مقابل رقم قطعة) غير موثَّق رسمياً بشكل يمكن التحقق منه هنا بدون شبكة -
-// إن فشل الاستدعاء لأي سبب، يُسجَّل تحذير بدل انهيار الخادم، ويستمر التحميل بلا تحديد نطاق
-// (سلوك أقدم لكن آمن) - راقب اللوغ بحثاً عن "[SelectWindow] فشل" للتأكد أنها تعمل فعلاً.
-function selectWindow(engine, from, to) {
+// *** تصحيح جوهري (بعد اختبار فعلي كشف نمو الذاكرة بالتوازي التام مع إجمالي البايتات
+// المنزَّلة من الشبكة رغم وجود "نافذة" مفعّلة ظاهرياً) ***
+// راجعنا مصدر torrent-stream مباشرة: File.prototype.select يستدعي
+//   this._torrent.select(this._startPiece, this._endPiece, priority)
+// أي أن engine.select(from, to, priority) يتوقع *رقم قطعة (piece index)* - عدد صحيح صغير
+// (مثلاً 0..90 لملف 1.5GB بقطع 16MB) - وليس بايت مطلق كما كان الكود القديم يمرره مباشرة
+// (مثل from=40000000). بما أن هذه القيم البايتية أكبر بمراحل من عدد القطع الحقيقي لأي
+// تورنت عادي، فإن أول نافذة select (عند بدء كل طلب بث) كانت تعني عملياً "اختر من القطعة 0
+// حتى ما بعد آخر قطعة موجودة في التورنت" - أي **الملف كاملاً** - وهذا هو السبب الحقيقي
+// لنمو الذاكرة بلا حدود المرصود في [Swarm Monitor] (الذاكرة ترتفع بالتوازي التام مع
+// "إجمالي منزَّل")، رغم أن SlidingWindowStore وآلية الإزاحة كانت تعمل بشكل صحيح تماماً -
+// المشكلة لم تكن في التخزين، بل في أن كل قطع الملف كانت "مُختارة" للتحميل من الأساس.
+// الإصلاح: نحوّل أي نطاق بايت إلى نطاق أرقام قطع فعلي عبر engine.torrent.pieceLength
+// (متوفر دائماً وقت البث، لأن الملف يكون في حالة "Ready" حينها) قبل أي استدعاء select/deselect.
+function byteRangeToPieceRange(engine, fromByte, toByte) {
+    const pieceLength = engine.torrent && engine.torrent.pieceLength;
+    if (!pieceLength) return null; // احتياط: لن يحدث عملياً لأن البث لا يبدأ قبل "Ready"
+    return {
+        fromPiece: Math.max(0, Math.floor(fromByte / pieceLength)),
+        toPiece: Math.max(0, Math.floor(toByte / pieceLength))
+    };
+}
+
+// *** تصحيح إضافي: حجم القطعة (pieceLength) ليس ثابتاً - يحدده من أنشأ التورنت، وعادة
+// يكبر مع حجم الملف الإجمالي (لتقليل عدد القطع الكلي). لملف 25GB مثلاً، القطعة الشائعة
+// 16-32MB وقد تصل 64MB. بميزانية بايت ثابتة (64MB/32MB)، لو كانت القطعة 64MB فإن
+// Math.floor(64MB / 64MB) = قطعة أمامية واحدة فقط (هامش خطير جداً لتعليق البث)، ولو
+// كانت القطعة 96MB فالنتيجة صفر قطعة - أي لا نافذة إطلاقاً وتعطّل تام للبث.
+// الإصلاح: نضمن حداً أدنى من *عدد القطع* الكاملة (لا بايت ثابت) بغض النظر عن حجم القطعة،
+// ونحسب الميزانية الفعلية بالبايت لكل تورنت على حدة بعد معرفة pieceLength الحقيقي له.
+const MIN_PIECES_AHEAD = parseInt(process.env.MIN_PIECES_AHEAD || '2', 10);
+const MIN_PIECES_BEHIND = parseInt(process.env.MIN_PIECES_BEHIND || '1', 10);
+
+const windowBudgetWarnedFor = new Set(); // لا نُكرر تحذير حجم القطعة الكبير لنفس التورنت كل طلب بث
+
+// يحسب ميزانية النافذة الفعلية بالبايت لهذا التورنت المحدد، مضمونةً حداً أدنى بعدد قطع
+// كاملة، مهما كان حجم القطعة. إن كانت القطعة كبيرة جداً، الميزانية الفعلية ستتجاوز
+// الهدف الاسمي (64MB/32MB) - هذا متوقع وأسلم من نافذة صفرية أو نافذة قطعة واحدة فقط؛
+// راجع سجل التحذير للتأكد من أن الرفع لا يكسر ميزانية MAX_MEMORY_MB الكلية.
+function computeWindowBudget(engine, infoHash) {
+    const pieceLength = engine.torrent && engine.torrent.pieceLength;
+    if (!pieceLength) return { aheadBytes: DOWNLOAD_WINDOW_AHEAD_BYTES, behindBytes: DOWNLOAD_WINDOW_BEHIND_BYTES };
+
+    const aheadPieces = Math.max(MIN_PIECES_AHEAD, Math.ceil(DOWNLOAD_WINDOW_AHEAD_BYTES / pieceLength));
+    const behindPieces = Math.max(MIN_PIECES_BEHIND, Math.ceil(DOWNLOAD_WINDOW_BEHIND_BYTES / pieceLength));
+    const aheadBytes = aheadPieces * pieceLength;
+    const behindBytes = behindPieces * pieceLength;
+
+    const totalWindowMB = (aheadBytes + behindBytes) / (1024 * 1024);
+    if (totalWindowMB > 150 && infoHash && !windowBudgetWarnedFor.has(infoHash)) {
+        windowBudgetWarnedFor.add(infoHash);
+        console.warn(
+            `[Window Budget] تحذير: قطعة هذا التورنت كبيرة (${(pieceLength / 1024 / 1024).toFixed(1)}MB) ` +
+            `مما يرفع نافذة التحميل الفعلية إلى ~${totalWindowMB.toFixed(0)}MB (${aheadPieces} أمام + ${behindPieces} خلف) ` +
+            `بدل الهدف الاسمي ~${(DOWNLOAD_WINDOW_AHEAD_MB + DOWNLOAD_WINDOW_BEHIND_MB).toFixed(0)}MB - ` +
+            `راقب MAX_MEMORY_MB/HARD_MEMORY_MB، وقلّل MAX_CONCURRENT_ENGINES إن لزم.`
+        );
+    }
+    return { aheadBytes, behindBytes };
+}
+
+// ملاحظة أمانة تقنية: engine.select/deselect هنا تُستدعى بمحاذير try/catch لأن توقيعها
+// الدقيق قد يختلف بين إصدارات الحزمة - إن فشل الاستدعاء لأي سبب، يُسجَّل تحذير بدل
+// انهيار الخادم، ويستمر التحميل بلا تحديد نطاق (سلوك أقدم لكن آمن) - راقب اللوغ بحثاً
+// عن "[SelectWindow] فشل" للتأكد أنها تعمل فعلاً.
+function selectWindow(engine, fromByte, toByte) {
+    const range = byteRangeToPieceRange(engine, fromByte, toByte);
+    if (!range) return;
     try {
-        engine.select(from, to, true);
+        engine.select(range.fromPiece, range.toPiece, true);
     } catch (e) {
-        console.warn(`[SelectWindow] فشل استدعاء engine.select(${from}, ${to}):`, e && e.message);
+        console.warn(`[SelectWindow] فشل استدعاء engine.select(${range.fromPiece}, ${range.toPiece}):`, e && e.message);
     }
 }
-function deselectWindow(engine, from, to) {
+function deselectWindow(engine, fromByte, toByte) {
+    const range = byteRangeToPieceRange(engine, fromByte, toByte);
+    if (!range) return;
     try {
-        engine.deselect(from, to, true);
+        engine.deselect(range.fromPiece, range.toPiece, true);
     } catch (e) {
-        console.warn(`[SelectWindow] فشل استدعاء engine.deselect(${from}, ${to}):`, e && e.message);
+        console.warn(`[SelectWindow] فشل استدعاء engine.deselect(${range.fromPiece}, ${range.toPiece}):`, e && e.message);
     }
 }
 
@@ -161,21 +226,23 @@ function deselectWindow(engine, from, to) {
 // واحد (شائع في مديري التحميل لتسريع النقل)، فكل اتصال يُدير نافذته الخاصة بشكل مستقل -
 // قد يتداخل هذا مع بعضه (اتصال يُلغي تحديد نطاق لا يزال اتصال آخر يحتاجه). راقب هذا
 // الاحتمال إن استمرت مشاكل الأداء رغم ثبات الذاكرة.
-function attachSelectionWindow(engine, fileOffset, rangeStart, rangeEnd) {
+function attachSelectionWindow(engine, fileOffset, rangeStart, rangeEnd, infoHash) {
     const absoluteRangeStart = fileOffset + rangeStart;
     const absoluteRangeEnd = fileOffset + rangeEnd;
+    // الميزانية الآن مخصوصة بهذا التورنت (حسب حجم قطعته الفعلي)، لا ثابتة عالمياً
+    const { aheadBytes, behindBytes } = computeWindowBudget(engine, infoHash);
     let currentWindow = null;
 
     function moveTo(consumedAbsoluteByte) {
-        const newTo = Math.min(consumedAbsoluteByte + DOWNLOAD_WINDOW_AHEAD_BYTES, absoluteRangeEnd);
-        const newFrom = Math.max(absoluteRangeStart, consumedAbsoluteByte - DOWNLOAD_WINDOW_BEHIND_BYTES);
+        const newTo = Math.min(consumedAbsoluteByte + aheadBytes, absoluteRangeEnd);
+        const newFrom = Math.max(absoluteRangeStart, consumedAbsoluteByte - behindBytes);
 
         if (currentWindow) {
             const aheadAdvance = newTo - currentWindow.to;
             const behindAdvance = newFrom - currentWindow.from;
             // حدّث فقط إن تقدّمت أي من الحافتين بمقدار معتبر (نصف ميزانيتها) - وإلا تجاهل
             // (بدون هذا الشرط، كان يُستدعى select/deselect عند كل دفعة بيانات تقريباً)
-            if (aheadAdvance < (DOWNLOAD_WINDOW_AHEAD_BYTES / 2) && behindAdvance < (DOWNLOAD_WINDOW_BEHIND_BYTES / 2)) return;
+            if (aheadAdvance < (aheadBytes / 2) && behindAdvance < (behindBytes / 2)) return;
             deselectWindow(engine, currentWindow.from, currentWindow.to);
         }
         selectWindow(engine, newFrom, newTo);
@@ -291,6 +358,7 @@ function destroyEngine(infoHash) {
     delete activeEngines[infoHash];
     delete engineStatus[infoHash];
     delete engineStores[infoHash];
+    windowBudgetWarnedFor.delete(infoHash);
     if (metadataTimers[infoHash]) {
         clearTimeout(metadataTimers[infoHash]);
         delete metadataTimers[infoHash];
@@ -554,7 +622,7 @@ app.get('/data/*', (req, res) => {
         res.setHeader('Content-Length', targetFile.length);
         res.setHeader('Accept-Ranges', 'bytes');
         res.setHeader('Content-Type', getContentType(filePath));
-        const window = attachSelectionWindow(ownerEngine, fileOffset, 0, targetFile.length - 1);
+        const window = attachSelectionWindow(ownerEngine, fileOffset, 0, targetFile.length - 1, ownerHash);
         const stream = targetFile.createReadStream();
         let sentBytes = 0;
         let destroyedByOurTimeout = false; // true فقط عندما نحن من قطعنا الاتصال بسبب التوقف المؤقت
@@ -608,7 +676,7 @@ app.get('/data/*', (req, res) => {
         'Content-Type': getContentType(filePath)
     });
 
-    const window = attachSelectionWindow(ownerEngine, fileOffset, start, end);
+    const window = attachSelectionWindow(ownerEngine, fileOffset, start, end, ownerHash);
     const stream = targetFile.createReadStream({ start, end });
     let sentRangeBytes = 0;
     let destroyedByOurTimeout = false; // true فقط عندما نحن من قطعنا الاتصال بسبب التوقف المؤقت
