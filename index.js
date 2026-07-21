@@ -103,6 +103,14 @@ const MAX_MEMORY_MB = parseInt(process.env.MAX_MEMORY_MB || '260', 10);
 // مهلة قصيرة جداً كانت تقتل البث ظلماً في هذه الحالة بالضبط.
 const STREAM_STALL_TIMEOUT_MS = parseInt(process.env.STREAM_STALL_TIMEOUT_MS || '90000', 10);
 
+// نفس فكرة STREAM_STALL_TIMEOUT_MS، لكن لمسار الطلب الأول بلا Range header (فحص أولي من
+// المتصفح/مدير التحميل قبل أي طلب Range). هذا المسار لم يكن يملك أي مهلة توقف مبكر إطلاقاً -
+// فإذا كان النظير الوحيد بطيئاً أو غير متجاوب، الطلب يبقى معلقاً بلا أي استجابة (حتى الهيدرز
+// لا تُرسل فعلياً) حتى تُغلقه SOCKET_IDLE_TIMEOUT_MS الخام بعد دقيقتين كاملتين - وهو ما يظهر
+// للمتصفح كانقطاع اتصال (ويؤدي لصفحة "chrome-error:" الداخلية في متصفح 1DM/Chrome WebView).
+// مهلة أقصر هنا كي نفشل بوضوح (504) وبسرعة أكبر بدل الاعتماد على مهلة الـ socket العمياء.
+const NO_RANGE_STALL_TIMEOUT_MS = parseInt(process.env.NO_RANGE_STALL_TIMEOUT_MS || '45000', 10);
+
 // مهلة إغلاق الـ socket قسراً إن ظلّ خاملاً تماماً (لا بيانات بأي اتجاه إطلاقاً) - أطول من
 // STREAM_STALL_TIMEOUT_MS عمداً (تلك تراقب فقط جانب القراءة من التورنت، وهذه تراقب الاتصال
 // الفعلي مع العميل ذاته). ضرورية لأن الاتصالات المقطوعة بصمت (شبكات موبايل) لا تُطلق أي حدث
@@ -236,6 +244,18 @@ setInterval(() => {
     const memoryUsage = process.memoryUsage();
     const rssMB = memoryUsage.rss / (1024 * 1024);
     console.log(`[Memory Monitor] Total RAM (RSS): ${rssMB.toFixed(2)} MB | Active torrents: ${Object.keys(activeEngines).length}`);
+
+    // تشخيص إضافي: عدد النظراء المتصلين فعلياً وسرعة التحميل الحقيقية لكل تورنت نشط -
+    // هذا يحسم بشكل مباشر في الاختبار القادم هل المشكلة "لا نظراء حقيقيون كافون" أم
+    // "نظراء متصلون لكن بلا أي تدفق بيانات فعلي" (احتُجنا لهذا بعد ملاحظة توقف كامل
+    // لمدة دقيقتين رغم ظهور peer واحد متصل و"Ready" في اللوغ)
+    Object.entries(activeEngines).forEach(([hash, engine]) => {
+        if (engine.swarm) {
+            const wireCount = (engine.swarm.wires && engine.swarm.wires.length) || 0;
+            const downloaded = engine.swarm.downloaded || 0;
+            console.log(`[Swarm Monitor] ${hash}: نظراء متصلون=${wireCount} | إجمالي منزَّل=${(downloaded / 1024 / 1024).toFixed(2)}MB`);
+        }
+    });
 
     if (rssMB > HARD_MEMORY_MB) {
         destroyAllEngines(`RSS ${rssMB.toFixed(2)}MB > الحد الطارئ ${HARD_MEMORY_MB}MB`);
@@ -537,7 +557,22 @@ app.get('/data/*', (req, res) => {
         const window = attachSelectionWindow(ownerEngine, fileOffset, 0, targetFile.length - 1);
         const stream = targetFile.createReadStream();
         let sentBytes = 0;
+        let destroyedByOurTimeout = false; // true فقط عندما نحن من قطعنا الاتصال بسبب التوقف المؤقت
+
+        let noRangeStreamTimeout = setTimeout(() => {
+            console.error(`[Timeout] لم تصل أي بايتات (بلا Range) لـ "${filePath}" خلال ${NO_RANGE_STALL_TIMEOUT_MS}ms - النظير الوحيد/الحالي بطيء جداً أو غير متجاوب.`);
+            destroyedByOurTimeout = true;
+            stream.destroy();
+            if (!res.headersSent) res.status(504).send('Torrent stream stalled (no data from peers)');
+        }, NO_RANGE_STALL_TIMEOUT_MS);
+
         stream.on('data', (chunk) => {
+            clearTimeout(noRangeStreamTimeout);
+            noRangeStreamTimeout = setTimeout(() => {
+                console.error(`[Timeout] تم قطع الاتصال المعلق (بلا Range) لـ "${filePath}".`);
+                destroyedByOurTimeout = true;
+                stream.destroy();
+            }, NO_RANGE_STALL_TIMEOUT_MS);
             sentBytes += chunk.length;
             const consumedAbsolute = fileOffset + sentBytes;
             if (store && typeof store.setPlayheadByte === 'function') {
@@ -545,11 +580,14 @@ app.get('/data/*', (req, res) => {
             }
             window.moveTo(consumedAbsolute);
         });
-        stream.on('end', () => window.cleanup());
-        // هذا المسار (بلا range) لا يملك مهلة توقف ذاتية، فـ 'close' هنا تعني دائماً
-        // انقطاعاً حقيقياً من العميل - آمن إلغاء التحديد عندها
-        stream.on('close', () => window.cleanup());
-        stream.on('error', (err) => { window.cleanup(); failSafely(err); });
+        stream.on('end', () => { clearTimeout(noRangeStreamTimeout); window.cleanup(); });
+        // نُلغي التحديد عند 'close' فقط إن كان السبب انقطاعاً حقيقياً من العميل، وليس توقفنا
+        // المؤقت الذاتي (نفس منطق مسار Range أدناه)
+        stream.on('close', () => {
+            clearTimeout(noRangeStreamTimeout);
+            if (!destroyedByOurTimeout) window.cleanup();
+        });
+        stream.on('error', (err) => { clearTimeout(noRangeStreamTimeout); window.cleanup(); failSafely(err); });
         return stream.pipe(res);
     }
 
